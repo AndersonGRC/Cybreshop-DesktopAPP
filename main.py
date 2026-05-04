@@ -425,7 +425,77 @@ class LoginView(QWidget):
             self.status.setStyleSheet("color: #b42318;")
             return
         self.status.setStyleSheet("")
+        # S2: forzar cambio antes de operar si la contrasena es la default.
+        if user.must_change_password:
+            dialog = ChangePasswordDialog(self, store=self.store, user=user, mandatory=True)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.status.setText("Debes cambiar la contrasena para continuar.")
+                self.status.setStyleSheet("color: #b42318;")
+                return
+            user.must_change_password = False
         self.on_login(user)
+
+
+# =============================================================================
+# Dialogo cambio de contrasena
+# =============================================================================
+class ChangePasswordDialog(QDialog):
+    def __init__(self, parent, store: LocalStore, user, mandatory: bool = False):
+        super().__init__(parent)
+        self.store = store
+        self.user = user
+        self.mandatory = mandatory
+        self.setWindowTitle("Cambiar contrasena")
+        self.setMinimumWidth(400)
+        if mandatory:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+
+        form = QFormLayout(self)
+        intro = QLabel(
+            "Tu cuenta usa la contrasena por defecto.\nDefine una nueva (minimo 6 caracteres) para continuar."
+            if mandatory else
+            "Define una nueva contrasena para tu cuenta."
+        )
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+
+        self.new_password = QLineEdit()
+        self.new_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm_password = QLineEdit()
+        self.confirm_password.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Nueva contrasena:", self.new_password)
+        form.addRow("Confirmar:", self.confirm_password)
+
+        self.feedback = QLabel("")
+        form.addRow(self.feedback)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save)
+        if not mandatory:
+            buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+            buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self._save)
+        form.addRow(buttons)
+
+    def _save(self):
+        pwd = self.new_password.text()
+        confirm = self.confirm_password.text()
+        if pwd != confirm:
+            self.feedback.setText("Las contrasenas no coinciden.")
+            self.feedback.setStyleSheet("color: #b42318; font-weight: 700;")
+            return
+        try:
+            self.store.change_password(self.user.id, pwd)
+        except ValueError as exc:
+            self.feedback.setText(str(exc))
+            self.feedback.setStyleSheet("color: #b42318; font-weight: 700;")
+            return
+        self.accept()
+
+    def reject(self):
+        if self.mandatory:
+            return  # bloquea cierre con Esc
+        super().reject()
 
 
 # =============================================================================
@@ -1131,15 +1201,11 @@ class PosPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "POS", str(exc))
             return
-        detail = self.store.sale_detail(sale.get("sale_id") or self._latest_sale_id())
+        detail = self.store.sale_detail(sale["sale_id"])
         self._show_receipt(detail or {"sale": sale, "items": self.cart})
         self._clear_cart()
         self.refresh()
         self.on_changed()
-
-    def _latest_sale_id(self):
-        sales = self.store.sales(limit=1)
-        return sales[0]["id"] if sales else None
 
     def _show_receipt(self, detail):
         sale = detail.get("sale", {})
@@ -1506,10 +1572,12 @@ def build_receipt_text(sale, items, branding=None):
 # Sync / estado de la BD
 # =============================================================================
 class SyncPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed):
+    def __init__(self, store: LocalStore, on_changed, user_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
+        # user_callback retorna el User logueado actualmente o None.
+        self._user_callback = user_callback or (lambda: None)
         self._build()
 
     def _build(self):
@@ -1612,6 +1680,14 @@ class SyncPage(QWidget):
         self.on_changed()
 
     def _clear_demo(self):
+        user = self._user_callback()
+        if not user or user.role != "Administrador":
+            QMessageBox.warning(
+                self,
+                "Permiso requerido",
+                "Solo un usuario con rol Administrador puede limpiar los datos.",
+            )
+            return
         confirm = QMessageBox.question(
             self,
             "Limpiar datos",
@@ -1619,7 +1695,11 @@ class SyncPage(QWidget):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        self.store.clear_demo_data()
+        try:
+            self.store.clear_demo_data(acting_user=user)
+        except PermissionError as exc:
+            QMessageBox.warning(self, "Permiso requerido", str(exc))
+            return
         self.refresh()
         self.on_changed()
 
@@ -1958,6 +2038,9 @@ class DesktopShell(QMainWindow):
     def _get_branding(self):
         return self.branding
 
+    def _get_user(self):
+        return self.user
+
     def _build_app_view(self):
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -2023,7 +2106,7 @@ class DesktopShell(QMainWindow):
             "inventory": InventoryPage(self.store, self._refresh_shared_pages),
             "sales": SalesPage(self.store, brand_callback=self._get_branding),
             "users": UsersPage(self.store, self._refresh_shared_pages),
-            "sync": SyncPage(self.store, self._refresh_shared_pages),
+            "sync": SyncPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
             "config": ConfiguracionPage(self.branding, self._app_dir, on_apply=self.apply_branding),
         }
         for page in self.pages.values():

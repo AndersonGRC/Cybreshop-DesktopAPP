@@ -3,12 +3,20 @@ import json
 import os
 import secrets
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 
 APP_DIR_NAME = "CyberShopNative"
 DB_FILE_NAME = "cybershop_offline.db"
+
+# Iteraciones PBKDF2-SHA256. OWASP 2023 recomienda >=600_000 para SHA-256.
+PBKDF2_ITERATIONS = 600_000
+LEGACY_PBKDF2_ITERATIONS = 120_000  # Hashes antiguos: re-hashear al login.
+
+DEFAULT_ADMIN_EMAIL = "admin@cybershop.local"
+DEFAULT_ADMIN_PASSWORD = "admin123"
 
 
 @dataclass
@@ -17,6 +25,7 @@ class User:
     email: str
     name: str
     role: str
+    must_change_password: bool = False
 
 
 def app_data_dir() -> Path:
@@ -45,22 +54,62 @@ class LocalStore:
         self._init_schema()
         self._seed_first_run()
 
+    @contextmanager
     def connect(self):
+        """Yield una conexion SQLite con FK activadas y commit/rollback automaticos.
+
+        - PRAGMA foreign_keys = ON enforce los REFERENCES del esquema.
+        - context manager garantiza que la conexion se cierra (no solo el cursor).
+        """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def authenticate(self, email: str, password: str) -> User | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT id, email, name, role, password_hash FROM users WHERE lower(email) = lower(?) AND active = 1",
+                """
+                SELECT id, email, name, role, password_hash, must_change_password
+                FROM users WHERE lower(email) = lower(?) AND active = 1
+                """,
                 (email,),
             ).fetchone()
 
-        if not row or not verify_password(password, row["password_hash"]):
-            return None
+            if not row or not verify_password(password, row["password_hash"]):
+                return None
 
-        return User(id=row["id"], email=row["email"], name=row["name"], role=row["role"])
+            # Migracion automatica: si el hash usa iteraciones antiguas, re-hashear.
+            stored_iters = _hash_iterations(row["password_hash"])
+            if stored_iters and stored_iters < PBKDF2_ITERATIONS:
+                conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (hash_password(password), row["id"]),
+                )
+
+        return User(
+            id=row["id"],
+            email=row["email"],
+            name=row["name"],
+            role=row["role"],
+            must_change_password=bool(row["must_change_password"]),
+        )
+
+    def change_password(self, user_id: int, new_password: str) -> None:
+        if not new_password or len(new_password) < 6:
+            raise ValueError("La nueva contrasena debe tener al menos 6 caracteres.")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+                (hash_password(new_password), int(user_id)),
+            )
 
     def dashboard_metrics(self):
         with self.connect() as conn:
@@ -138,12 +187,21 @@ class LocalStore:
         }
 
         with self.connect() as conn:
+            # SKU duplicado: si el match es un producto inactivo y estamos creando,
+            # reactivamos en vez de fallar con UNIQUE constraint.
             dup_sku = conn.execute(
-                "SELECT id FROM products WHERE sku = ? AND id != COALESCE(?, -1)",
+                "SELECT id, active FROM products WHERE sku = ? AND id != COALESCE(?, -1)",
                 (sku, product_id),
             ).fetchone()
             if dup_sku:
-                raise ValueError(f"El SKU '{sku}' ya esta en uso por otro producto.")
+                if dup_sku["active"]:
+                    raise ValueError(f"El SKU '{sku}' ya esta en uso por otro producto activo.")
+                if product_id:
+                    raise ValueError(
+                        f"El SKU '{sku}' pertenece a un producto desactivado. Desactiva o renombra ese antes."
+                    )
+                # Reactivamos el desactivado con los nuevos datos en vez de crear.
+                product_id = dup_sku["id"]
 
             if barcode:
                 dup_barcode = conn.execute(
@@ -160,6 +218,7 @@ class LocalStore:
                     """
                     UPDATE products
                     SET sku = ?, barcode = ?, name = ?, category = ?, stock = ?, min_stock = ?, price = ?,
+                        active = 1,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
@@ -301,7 +360,7 @@ class LocalStore:
                 )
 
             self._queue_outbox(conn, "sale", str(sale_id), "create", {"receipt": receipt, "total": total, "items": normalized})
-        return {"receipt": receipt, "total": total}
+        return {"sale_id": int(sale_id), "receipt": receipt, "total": total}
 
     def sales(self, limit=200):
         with self.connect() as conn:
@@ -424,8 +483,14 @@ class LocalStore:
         with self.connect() as conn:
             conn.execute("UPDATE outbox SET synced_at = CURRENT_TIMESTAMP WHERE synced_at IS NULL")
 
-    def clear_demo_data(self):
-        """Borra productos, ventas, movimientos y outbox demo. Mantiene usuarios."""
+    def clear_demo_data(self, acting_user: User | None = None):
+        """Borra productos, ventas, movimientos y outbox demo. Mantiene usuarios.
+
+        Solo permite la operacion si acting_user tiene rol Administrador.
+        Marca seed_done=1 para evitar que el seed inicial vuelva a poblar.
+        """
+        if acting_user is None or acting_user.role != "Administrador":
+            raise PermissionError("Solo un Administrador puede limpiar los datos demo.")
         with self.connect() as conn:
             conn.executescript(
                 """
@@ -437,6 +502,7 @@ class LocalStore:
                 DELETE FROM sqlite_sequence WHERE name IN ('sales','sale_items','inventory_movements','products','outbox');
                 """
             )
+            self._set_meta(conn, "seed_done", "1")
 
     def db_info(self):
         with self.connect() as conn:
@@ -477,6 +543,7 @@ class LocalStore:
                     role TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1,
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -494,17 +561,21 @@ class LocalStore:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
+
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
 
-            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
-            if "barcode" not in existing_cols:
-                conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
+            # Migraciones idempotentes (ALTER TABLE no es opcional en SQLite si la columna ya existe).
+            self._ensure_column(conn, "products", "barcode", "TEXT")
+            self._ensure_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
 
             conn.executescript(
                 """
-
                 CREATE TABLE IF NOT EXISTS sales (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     receipt_number TEXT NOT NULL UNIQUE,
@@ -514,7 +585,7 @@ class LocalStore:
 
                 CREATE TABLE IF NOT EXISTS sale_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    sale_id INTEGER NOT NULL REFERENCES sales(id),
+                    sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
                     product_id INTEGER NOT NULL REFERENCES products(id),
                     quantity INTEGER NOT NULL,
                     unit_price REAL NOT NULL,
@@ -541,6 +612,22 @@ class LocalStore:
                 """
             )
 
+    def _ensure_column(self, conn, table, column, ddl):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _get_meta(self, conn, key, default=None):
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def _set_meta(self, conn, key, value):
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
     def _queue_outbox(self, conn, entity, entity_id, action, payload):
         conn.execute(
             """
@@ -555,52 +642,87 @@ class LocalStore:
         return f"LOCAL-{int(next_id):04d}"
 
     def _seed_first_run(self):
+        """Crea admin y productos demo SOLO en el primer arranque.
+
+        Usa metadata.seed_done para no re-sembrar despues de Limpiar datos.
+        El admin queda marcado con must_change_password = 1 para forzar
+        cambio antes de operar.
+        """
         with self.connect() as conn:
+            # Admin: si no hay ningun usuario, sembrar.
             user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             if user_count == 0:
                 conn.execute(
                     """
-                    INSERT INTO users (email, name, role, password_hash)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO users (email, name, role, password_hash, must_change_password)
+                    VALUES (?, ?, ?, ?, 1)
                     """,
                     (
-                        "admin@cybershop.local",
+                        DEFAULT_ADMIN_EMAIL,
                         "Administrador Local",
                         "Administrador",
-                        hash_password("admin123"),
+                        hash_password(DEFAULT_ADMIN_PASSWORD),
                     ),
                 )
 
-            product_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-            if product_count == 0:
-                conn.executemany(
-                    """
-                    INSERT INTO products (sku, barcode, name, category, stock, min_stock, price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        ("DEMO-001", "7701234567890", "Producto demo POS", "General", 18, 5, 25000),
-                        ("DEMO-002", "7701234567891", "Inventario bajo", "General", 2, 5, 48000),
-                        ("DEMO-003", "7701234567892", "Servicio local", "Servicios", 99, 10, 120000),
-                    ],
-                )
+            # Productos demo: solo si NUNCA se hizo el seed (no si user limpio datos).
+            seed_done = self._get_meta(conn, "seed_done") == "1"
+            if not seed_done:
+                product_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+                if product_count == 0:
+                    conn.executemany(
+                        """
+                        INSERT INTO products (sku, barcode, name, category, stock, min_stock, price)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            ("DEMO-001", "7701234567890", "Producto demo POS", "General", 18, 5, 25000),
+                            ("DEMO-002", "7701234567891", "Inventario bajo", "General", 2, 5, 48000),
+                            ("DEMO-003", "7701234567892", "Servicio local", "Servicios", 99, 10, 120000),
+                        ],
+                    )
+                self._set_meta(conn, "seed_done", "1")
 
 
 
-def hash_password(password: str) -> str:
+def hash_password(password: str, iterations: int = PBKDF2_ITERATIONS) -> str:
+    """Genera hash PBKDF2-SHA256 con salt aleatorio y conteo de iteraciones embebido.
+
+    Formato: pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>
+    El conteo se incluye para que verify_password sepa que iteraciones usar y
+    detectar hashes antiguos que necesitan re-hashing.
+    """
     salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
-    return f"pbkdf2_sha256${salt}${digest.hex()}"
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations
+    )
+    return f"pbkdf2_sha256${iterations}${salt}${digest.hex()}"
+
+
+def _parse_hash(stored_hash: str):
+    """Parsea ambos formatos: nuevo (con iters) y legacy (sin iters)."""
+    parts = stored_hash.split("$")
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+        try:
+            return parts[0], int(parts[1]), parts[2], parts[3]
+        except ValueError:
+            return None
+    if len(parts) == 3 and parts[0] == "pbkdf2_sha256":
+        return parts[0], LEGACY_PBKDF2_ITERATIONS, parts[1], parts[2]
+    return None
+
+
+def _hash_iterations(stored_hash: str) -> int:
+    parsed = _parse_hash(stored_hash)
+    return parsed[1] if parsed else 0
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    try:
-        algorithm, salt, expected = stored_hash.split("$", 2)
-    except ValueError:
+    parsed = _parse_hash(stored_hash)
+    if not parsed:
         return False
-
-    if algorithm != "pbkdf2_sha256":
-        return False
-
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    _algorithm, iterations, salt, expected = parsed
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations
+    )
     return secrets.compare_digest(digest.hex(), expected)
