@@ -276,12 +276,21 @@ class LocalStore:
                 """,
                 (product_id, quantity_delta, reason),
             )
+            local_mov_id = cur.lastrowid
+            sku_row = conn.execute("SELECT sku FROM products WHERE id = ?", (product_id,)).fetchone()
+            sku = sku_row["sku"] if sku_row else None
             self._queue_outbox(
                 conn,
                 "inventory_movement",
-                str(cur.lastrowid),
+                str(local_mov_id),
                 "create",
-                {"product_id": product_id, "quantity_delta": quantity_delta, "reason": reason},
+                {
+                    "client_movement_id": f"desktop-{local_mov_id}",
+                    "product_id": product_id,
+                    "sku": sku,
+                    "quantity_delta": quantity_delta,
+                    "reason": reason,
+                },
             )
         return new_stock
 
@@ -359,7 +368,19 @@ class LocalStore:
                     (item["product_id"], -item["quantity"], f"Venta {receipt}"),
                 )
 
-            self._queue_outbox(conn, "sale", str(sale_id), "create", {"receipt": receipt, "total": total, "items": normalized})
+            sale_row = conn.execute(
+                "SELECT created_at FROM sales WHERE id = ?", (sale_id,)
+            ).fetchone()
+            created_at_local = sale_row["created_at"] if sale_row else None
+            self._queue_outbox(
+                conn, "sale", str(sale_id), "create",
+                {
+                    "receipt": receipt,
+                    "total": total,
+                    "created_at_local": created_at_local,
+                    "items": normalized,
+                },
+            )
         return {"sale_id": int(sale_id), "receipt": receipt, "total": total}
 
     def sales(self, limit=200):
@@ -531,6 +552,98 @@ class LocalStore:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement")):
+        """Devuelve items pendientes de enviar al servidor (max `limit`).
+
+        Filtra por entidades soportadas por el server (sale, inventory_movement).
+        Otras entidades quedan encoladas pero no se intentan empujar.
+        """
+        placeholders = ",".join("?" * len(entities))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, entity, entity_id, action, payload, created_at
+                FROM outbox
+                WHERE synced_at IS NULL
+                  AND entity IN ({placeholders})
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (*entities, int(limit)),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "entity": row["entity"],
+                "entity_id": row["entity_id"],
+                "action": row["action"],
+                "payload": json.loads(row["payload"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def mark_outbox_synced(self, ids):
+        """Marca los items de outbox como sincronizados (synced_at = ahora)."""
+        ids = [int(i) for i in ids if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"UPDATE outbox SET synced_at = CURRENT_TIMESTAMP "
+                f"WHERE id IN ({placeholders}) AND synced_at IS NULL",
+                ids,
+            )
+            return cur.rowcount
+
+    def upsert_product_from_remote(self, remote_product):
+        """Aplica un producto del servidor al SQLite local.
+
+        Match por SKU (lo que el server llama 'sku' viene de productos.referencia).
+        Si no existe, lo crea. Si existe, actualiza precio/nombre/stock/categoria.
+        El campo barcode no se toca (la web no lo maneja, lo gestiona el desktop).
+        Esta operacion NO encola outbox (no es un cambio local).
+        """
+        sku = (remote_product.get("sku") or "").strip()
+        if not sku:
+            raise ValueError("Producto remoto sin sku")
+
+        name = (remote_product.get("name") or "").strip() or sku
+        category = (remote_product.get("category") or "General").strip() or "General"
+        try:
+            price = float(remote_product.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            stock = int(remote_product.get("stock") or 0)
+        except (TypeError, ValueError):
+            stock = 0
+
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM products WHERE sku = ?", (sku,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET name = ?, category = ?, price = ?, stock = ?,
+                        active = 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (name, category, price, stock, existing["id"]),
+                )
+                return {"action": "updated", "local_id": int(existing["id"])}
+            cur = conn.execute(
+                """
+                INSERT INTO products (sku, name, category, price, stock, min_stock, active)
+                VALUES (?, ?, ?, ?, ?, 0, 1)
+                """,
+                (sku, name, category, price, stock),
+            )
+            return {"action": "created", "local_id": int(cur.lastrowid)}
 
     def _init_schema(self):
         with self.connect() as conn:

@@ -35,10 +35,12 @@ from PyQt6.QtWidgets import (
 )
 
 import branding as branding_mod
+import sync_config as sync_cfg
 from local_store import LocalStore, app_data_dir
+from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 ROLES = ["Administrador", "Cajero", "Inventario"]
 
 
@@ -1572,29 +1574,88 @@ def build_receipt_text(sale, items, branding=None):
 # Sync / estado de la BD
 # =============================================================================
 class SyncPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed, user_callback=None):
+    def __init__(self, store: LocalStore, on_changed, base_dir: Path, user_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
-        # user_callback retorna el User logueado actualmente o None.
+        self._base_dir = base_dir
         self._user_callback = user_callback or (lambda: None)
+        self._sync_state = sync_cfg.load(base_dir)
+        self._auto_timer = QTimer(self)
+        self._auto_timer.timeout.connect(self._sync_now_silent)
         self._build()
+        self._restart_auto_timer()
 
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(14)
 
-        title = QLabel("Sincronizacion / estado local")
+        title = QLabel("Sincronizacion")
         title.setObjectName("pageTitle")
         subtitle = QLabel(
-            "Esta instalacion guarda todo en una base SQLite local. La cola outbox "
-            "queda preparada para enviar al servidor cuando se habilite la integracion."
+            "Configura la URL del servidor y la API key entregada por el admin. "
+            "Las ventas y movimientos del POS suben al VPS, los productos del VPS bajan al desktop."
         )
         subtitle.setObjectName("muted")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        # Panel de configuracion remota
+        sync_panel = QFrame()
+        sync_panel.setObjectName("sectionPanel")
+        sync_form = QFormLayout(sync_panel)
+        sync_form.setContentsMargins(16, 16, 16, 16)
+        sync_form.setSpacing(8)
+
+        self.url_input = QLineEdit(self._sync_state.get("base_url", ""))
+        self.url_input.setPlaceholderText("https://cybershopcol.com")
+
+        self.key_input = QLineEdit(self._sync_state.get("api_key", ""))
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_input.setPlaceholderText("cs_sync_...")
+
+        self.auto_check = QCheckBox("Sincronizar automaticamente cada")
+        self.auto_check.setChecked(bool(self._sync_state.get("enabled", False)))
+        self.auto_check.toggled.connect(self._on_auto_toggle)
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(5, 3600)
+        self.interval_spin.setSuffix(" seg")
+        self.interval_spin.setValue(int(self._sync_state.get("interval_sec", 30)))
+        self.interval_spin.valueChanged.connect(self._on_interval_change)
+
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(self.auto_check)
+        auto_row.addWidget(self.interval_spin)
+        auto_row.addStretch(1)
+
+        sync_form.addRow("URL servidor:", self.url_input)
+        sync_form.addRow("API key:", self.key_input)
+        sync_form.addRow("", _wrap_layout(auto_row))
+
+        actions_row = QHBoxLayout()
+        save_btn = QPushButton("Guardar configuracion")
+        save_btn.setObjectName("secondaryAction")
+        save_btn.clicked.connect(self._save_sync_config)
+        test_btn = QPushButton("Probar conexion")
+        test_btn.setObjectName("secondaryAction")
+        test_btn.clicked.connect(self._test_connection)
+        sync_now_btn = QPushButton("Sincronizar ahora")
+        sync_now_btn.setObjectName("primaryAction")
+        sync_now_btn.clicked.connect(self._sync_now_clicked)
+        actions_row.addWidget(save_btn)
+        actions_row.addWidget(test_btn)
+        actions_row.addWidget(sync_now_btn)
+        actions_row.addStretch(1)
+        sync_form.addRow("", _wrap_layout(actions_row))
+
+        self.sync_status = QLabel(self._format_status())
+        self.sync_status.setWordWrap(True)
+        sync_form.addRow("Estado:", self.sync_status)
+
+        layout.addWidget(sync_panel)
 
         self.info_panel = QFrame()
         self.info_panel.setObjectName("sectionPanel")
@@ -1678,6 +1739,136 @@ class SyncPage(QWidget):
         self.store.reset_outbox()
         self.refresh()
         self.on_changed()
+
+    # ── Sync remoto ──────────────────────────────────────────
+    def _format_status(self):
+        last_sync = self._sync_state.get("last_sync_at") or "nunca"
+        last_status = self._sync_state.get("last_sync_status") or "sin intentos"
+        return f"Ultimo intento: {last_sync} - {last_status}"
+
+    def _save_sync_config(self):
+        url = self.url_input.text().strip().rstrip("/")
+        key = self.key_input.text().strip()
+        sync_cfg.update(
+            self._base_dir,
+            base_url=url,
+            api_key=key,
+            enabled=self.auto_check.isChecked(),
+            interval_sec=self.interval_spin.value(),
+        )
+        self._sync_state = sync_cfg.load(self._base_dir)
+        self._restart_auto_timer()
+        self._set_status_text("Configuracion guardada.", error=False)
+
+    def _on_auto_toggle(self, checked):
+        sync_cfg.update(self._base_dir, enabled=bool(checked))
+        self._sync_state["enabled"] = bool(checked)
+        self._restart_auto_timer()
+
+    def _on_interval_change(self, value):
+        sync_cfg.update(self._base_dir, interval_sec=int(value))
+        self._sync_state["interval_sec"] = int(value)
+        self._restart_auto_timer()
+
+    def _restart_auto_timer(self):
+        self._auto_timer.stop()
+        if self._sync_state.get("enabled") and self._sync_state.get("base_url") and self._sync_state.get("api_key"):
+            interval_ms = max(5, int(self._sync_state.get("interval_sec", 30))) * 1000
+            self._auto_timer.start(interval_ms)
+
+    def _build_client(self):
+        return SyncClient(self._sync_state.get("base_url", ""), self._sync_state.get("api_key", ""))
+
+    def _test_connection(self):
+        try:
+            client = self._build_client()
+            info = client.health()
+        except (ValueError, SyncError) as exc:
+            self._set_status_text(f"Conexion fallo: {exc}", error=True)
+            return
+        msg = f"Conexion OK -> tenant_db={info.get('tenant_db')}, server_time={info.get('server_time')}"
+        self._set_status_text(msg, error=False)
+
+    def _sync_now_clicked(self):
+        try:
+            applied, pulled, errors = self._do_sync()
+        except (ValueError, SyncError) as exc:
+            self._record_status(f"error: {exc}")
+            self._set_status_text(f"Sync fallo: {exc}", error=True)
+            return
+        msg = f"Sync OK: {pulled} producto(s) bajaron, {applied} item(s) subieron"
+        if errors:
+            msg += f", {errors} con error en server"
+        self._record_status("ok" + (f" ({errors} errores)" if errors else ""))
+        self._set_status_text(msg, error=False)
+        self.refresh()
+        self.on_changed()
+
+    def _sync_now_silent(self):
+        """Variante para timer automatico: no muestra QMessageBox, solo actualiza estado."""
+        try:
+            applied, pulled, errors = self._do_sync()
+            self._record_status("ok" + (f" ({errors} errores)" if errors else ""))
+            self.sync_status.setText(self._format_status() + f" - {pulled} bajaron, {applied} subieron")
+            self.refresh()
+            self.on_changed()
+        except (ValueError, SyncError) as exc:
+            self._record_status(f"error: {str(exc)[:120]}")
+            self.sync_status.setText(self._format_status())
+            self.sync_status.setStyleSheet("color: #b42318;")
+
+    def _do_sync(self):
+        """Ejecuta pull productos + push outbox. Retorna (applied, pulled, errors)."""
+        client = self._build_client()
+        # Pull
+        since = self._sync_state.get("last_pull_at") or None
+        pull_resp = client.pull_products(since=since, limit=500)
+        pulled = 0
+        for remote in pull_resp.get("items", []):
+            try:
+                self.store.upsert_product_from_remote(remote)
+                pulled += 1
+            except Exception as exc:  # noqa: BLE001
+                # No frenar el pull entero por un producto malo
+                print(f"[sync] upsert fallo para {remote.get('sku')}: {exc}")
+        if pull_resp.get("cursor"):
+            sync_cfg.update(self._base_dir, last_pull_at=pull_resp["cursor"])
+            self._sync_state["last_pull_at"] = pull_resp["cursor"]
+
+        # Push
+        pending = self.store.pending_outbox(limit=100)
+        applied = 0
+        errors = 0
+        if pending:
+            push_payload = [
+                {"local_id": p["id"], "entity": p["entity"], "action": p["action"], "payload": p["payload"]}
+                for p in pending
+            ]
+            push_resp = client.push_outbox(push_payload)
+            done_ids = []
+            for r in push_resp.get("results", []):
+                if r["status"] in ("applied", "skipped"):
+                    done_ids.append(r["local_id"])
+                    applied += 1
+                else:
+                    errors += 1
+            self.store.mark_outbox_synced(done_ids)
+        return applied, pulled, errors
+
+    def _record_status(self, status_text):
+        from datetime import datetime
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sync_cfg.update(
+            self._base_dir,
+            last_sync_status=status_text,
+            last_sync_at=now_iso,
+        )
+        self._sync_state["last_sync_status"] = status_text
+        self._sync_state["last_sync_at"] = now_iso
+
+    def _set_status_text(self, text, error=False):
+        self.sync_status.setText(text + " | " + self._format_status())
+        self.sync_status.setStyleSheet("color: #b42318; font-weight: 700;" if error else "color: #5a7a14; font-weight: 700;")
 
     def _clear_demo(self):
         user = self._user_callback()
@@ -2106,7 +2297,7 @@ class DesktopShell(QMainWindow):
             "inventory": InventoryPage(self.store, self._refresh_shared_pages),
             "sales": SalesPage(self.store, brand_callback=self._get_branding),
             "users": UsersPage(self.store, self._refresh_shared_pages),
-            "sync": SyncPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
+            "sync": SyncPage(self.store, self._refresh_shared_pages, base_dir=self._app_dir, user_callback=self._get_user),
             "config": ConfiguracionPage(self.branding, self._app_dir, on_apply=self.apply_branding),
         }
         for page in self.pages.values():
@@ -2241,6 +2432,13 @@ def placeholder_page(title, text):
     layout.addWidget(body)
     layout.addStretch(1)
     return page
+
+
+def _wrap_layout(inner_layout):
+    """Envuelve un QLayout en un QWidget para usarlo en QFormLayout.addRow."""
+    w = QWidget()
+    w.setLayout(inner_layout)
+    return w
 
 
 def clear_layout(layout):
