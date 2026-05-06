@@ -133,7 +133,8 @@ class LocalStore:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, sku, barcode, name, category, stock, min_stock, price
+                SELECT id, sku, barcode, name, category, stock, min_stock, price,
+                       image_path, genero_id, remote_id, updated_at
                 FROM products
                 WHERE active = 1
                 ORDER BY name
@@ -173,17 +174,22 @@ class LocalStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def save_product(self, product_id, sku, name, category, stock, min_stock, price, barcode=""):
+    def save_product(self, product_id, sku, name, category, stock, min_stock, price,
+                     barcode="", image_path="", genero_id=None):
         sku = (sku or "").strip()
         barcode = (barcode or "").strip() or None
+        image_path = (image_path or "").strip() or None
         payload = {
             "sku": sku,
-            "barcode": barcode,
+            "barcode": barcode or "",
             "name": name,
             "category": category,
             "stock": int(stock),
             "min_stock": int(min_stock),
             "price": float(price),
+            "image": image_path or "",
+            "genero_id": int(genero_id) if genero_id else None,
+            "active": True,
         }
 
         with self.connect() as conn:
@@ -217,36 +223,53 @@ class LocalStore:
                 conn.execute(
                     """
                     UPDATE products
-                    SET sku = ?, barcode = ?, name = ?, category = ?, stock = ?, min_stock = ?, price = ?,
-                        active = 1,
+                    SET sku = ?, barcode = ?, name = ?, category = ?, stock = ?, min_stock = ?,
+                        price = ?, image_path = ?, genero_id = ?, active = 1,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (sku, barcode, name, category, int(stock), int(min_stock), float(price), int(product_id)),
+                    (sku, barcode, name, category, int(stock), int(min_stock), float(price),
+                     image_path, genero_id, int(product_id)),
                 )
                 entity_id = str(product_id)
                 action = "update"
             else:
                 cur = conn.execute(
                     """
-                    INSERT INTO products (sku, barcode, name, category, stock, min_stock, price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO products (sku, barcode, name, category, stock, min_stock,
+                                          price, image_path, genero_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (sku, barcode, name, category, int(stock), int(min_stock), float(price)),
+                    (sku, barcode, name, category, int(stock), int(min_stock), float(price),
+                     image_path, genero_id),
                 )
                 entity_id = str(cur.lastrowid)
                 action = "create"
 
+            # Releer updated_at para que el server pueda hacer LWW
+            row = conn.execute("SELECT updated_at FROM products WHERE id = ?", (entity_id,)).fetchone()
+            payload["updated_at"] = row["updated_at"] if row else None
             self._queue_outbox(conn, "product", entity_id, action, payload)
         return entity_id
 
     def delete_product(self, product_id):
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT sku FROM products WHERE id = ?", (int(product_id),)
+            ).fetchone()
+            sku = row["sku"] if row else None
             conn.execute(
                 "UPDATE products SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (int(product_id),),
             )
-            self._queue_outbox(conn, "product", str(product_id), "delete", {"id": int(product_id)})
+            ts = conn.execute(
+                "SELECT updated_at FROM products WHERE id = ?", (int(product_id),)
+            ).fetchone()
+            self._queue_outbox(conn, "product", str(product_id), "delete", {
+                "sku": sku,
+                "active": False,
+                "updated_at": ts["updated_at"] if ts else None,
+            })
 
     def adjust_stock(self, product_id, quantity_delta, reason):
         product_id = int(product_id)
@@ -473,15 +496,18 @@ class LocalStore:
             if user_id:
                 if password:
                     conn.execute(
-                        "UPDATE users SET email=?, name=?, role=?, active=?, password_hash=? WHERE id=?",
+                        "UPDATE users SET email=?, name=?, role=?, active=?, password_hash=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (email, name, role, 1 if active else 0, hash_password(password), int(user_id)),
                     )
                 else:
                     conn.execute(
-                        "UPDATE users SET email=?, name=?, role=?, active=? WHERE id=?",
+                        "UPDATE users SET email=?, name=?, role=?, active=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (email, name, role, 1 if active else 0, int(user_id)),
                     )
-                return int(user_id)
+                final_id = int(user_id)
+                action = "update"
             else:
                 if not password:
                     raise ValueError("La contrasena es obligatoria al crear un usuario.")
@@ -489,7 +515,18 @@ class LocalStore:
                     "INSERT INTO users (email, name, role, password_hash, active) VALUES (?, ?, ?, ?, ?)",
                     (email, name, role, hash_password(password), 1 if active else 0),
                 )
-                return cur.lastrowid
+                final_id = int(cur.lastrowid)
+                action = "create"
+
+            ts = conn.execute("SELECT updated_at FROM users WHERE id = ?", (final_id,)).fetchone()
+            self._queue_outbox(conn, "user", str(final_id), action, {
+                "email": email,
+                "nombre": name,
+                "rol_nombre": role,
+                "estado": "habilitado" if active else "deshabilitado",
+                "updated_at": ts["updated_at"] if ts else None,
+            })
+            return final_id
 
     def deactivate_user(self, user_id):
         with self.connect() as conn:
@@ -498,7 +535,18 @@ class LocalStore:
             ).fetchone()[0]
             if count_active == 0:
                 raise ValueError("No puedes desactivar el ultimo usuario activo.")
-            conn.execute("UPDATE users SET active = 0 WHERE id = ?", (int(user_id),))
+            row = conn.execute("SELECT email FROM users WHERE id = ?", (int(user_id),)).fetchone()
+            email = row["email"] if row else None
+            conn.execute(
+                "UPDATE users SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(user_id),),
+            )
+            ts = conn.execute("SELECT updated_at FROM users WHERE id = ?", (int(user_id),)).fetchone()
+            self._queue_outbox(conn, "user", str(user_id), "delete", {
+                "email": email,
+                "estado": "deshabilitado",
+                "updated_at": ts["updated_at"] if ts else None,
+            })
 
     def reset_outbox(self):
         with self.connect() as conn:
@@ -553,7 +601,7 @@ class LocalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement")):
+    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement", "product", "user")):
         """Devuelve items pendientes de enviar al servidor (max `limit`).
 
         Filtra por entidades soportadas por el server (sale, inventory_movement).
@@ -601,10 +649,9 @@ class LocalStore:
     def upsert_product_from_remote(self, remote_product):
         """Aplica un producto del servidor al SQLite local.
 
-        Match por SKU (lo que el server llama 'sku' viene de productos.referencia).
-        Si no existe, lo crea. Si existe, actualiza precio/nombre/stock/categoria.
-        El campo barcode no se toca (la web no lo maneja, lo gestiona el desktop).
-        Esta operacion NO encola outbox (no es un cambio local).
+        Match por SKU. Respeta active (si server.active=False, marca local
+        como inactivo). NO encola outbox (no es un cambio local). Tambien
+        guarda remote_id, barcode, genero_id e image_path.
         """
         sku = (remote_product.get("sku") or "").strip()
         if not sku:
@@ -612,6 +659,11 @@ class LocalStore:
 
         name = (remote_product.get("name") or "").strip() or sku
         category = (remote_product.get("category") or "General").strip() or "General"
+        barcode = (remote_product.get("barcode") or "").strip() or None
+        image = (remote_product.get("image") or "").strip() or None
+        remote_id = remote_product.get("remote_id")
+        genero_id = remote_product.get("genero_id")
+        active = 1 if remote_product.get("active", True) else 0
         try:
             price = float(remote_product.get("price") or 0)
         except (TypeError, ValueError):
@@ -630,20 +682,181 @@ class LocalStore:
                     """
                     UPDATE products
                     SET name = ?, category = ?, price = ?, stock = ?,
-                        active = 1, updated_at = CURRENT_TIMESTAMP
+                        barcode = ?, image_path = ?, genero_id = ?,
+                        remote_id = ?, active = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (name, category, price, stock, existing["id"]),
+                    (name, category, price, stock, barcode, image, genero_id,
+                     remote_id, active, existing["id"]),
                 )
                 return {"action": "updated", "local_id": int(existing["id"])}
             cur = conn.execute(
                 """
-                INSERT INTO products (sku, name, category, price, stock, min_stock, active)
-                VALUES (?, ?, ?, ?, ?, 0, 1)
+                INSERT INTO products (sku, name, category, price, stock, min_stock,
+                                      barcode, image_path, genero_id, remote_id, active)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                 """,
-                (sku, name, category, price, stock),
+                (sku, name, category, price, stock, barcode, image, genero_id, remote_id, active),
             )
             return {"action": "created", "local_id": int(cur.lastrowid)}
+
+    def upsert_genero_from_remote(self, remote):
+        """UPSERT por remote_id. Devuelve {action, local_id}."""
+        rid = remote.get("remote_id")
+        nombre = (remote.get("nombre") or "").strip()
+        if not rid or not nombre:
+            raise ValueError("genero remoto sin remote_id o nombre")
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM generos WHERE remote_id = ?", (int(rid),)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE generos SET nombre = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (nombre, existing["id"]),
+                )
+                return {"action": "updated", "local_id": int(existing["id"])}
+            cur = conn.execute(
+                "INSERT INTO generos (remote_id, nombre) VALUES (?, ?)",
+                (int(rid), nombre),
+            )
+            return {"action": "created", "local_id": int(cur.lastrowid)}
+
+    def list_generos(self):
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, remote_id, nombre FROM generos ORDER BY nombre"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_user_from_remote(self, remote):
+        """Sincroniza perfil de usuario (sin password).
+
+        Match por email (case-insensitive). Si no existe en local, lo crea con
+        un password_hash placeholder (must_change_password=1) para que el
+        operador haga reset al primer login en este lado.
+        """
+        email = (remote.get("email") or "").strip().lower()
+        if not email:
+            raise ValueError("usuario remoto sin email")
+        nombre = (remote.get("nombre") or remote.get("name") or email).strip()
+        rol = (remote.get("rol_nombre") or remote.get("role") or "Cajero").strip()
+        # Mapeo de rol web -> rol desktop
+        if rol.lower() in ("admin", "administrador"):
+            rol = "Administrador"
+        elif rol.lower() in ("cajero", "vendedor"):
+            rol = "Cajero"
+        else:
+            rol = "Cajero"
+        estado = (remote.get("estado") or "habilitado").strip().lower()
+        active = 0 if estado in ("deshabilitado", "eliminado") else 1
+        remote_id = remote.get("remote_id")
+
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE users SET name = ?, role = ?, active = ?, remote_id = ?,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    """,
+                    (nombre, rol, active, remote_id, existing["id"]),
+                )
+                return {"action": "updated", "local_id": int(existing["id"])}
+            placeholder = "PLACEHOLDER_RESET_REQUIRED_" + secrets.token_hex(8)
+            cur = conn.execute(
+                """
+                INSERT INTO users (email, name, role, password_hash, active,
+                                   must_change_password, remote_id)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+                """,
+                (email, nombre, rol, placeholder, active, remote_id),
+            )
+            return {"action": "created", "local_id": int(cur.lastrowid)}
+
+    def cache_remote_sale(self, remote):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO remote_sales_cache
+                  (remote_id, reference, customer_name, customer_email,
+                   status_payment, status_shipping, total, payment_method,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(remote_id) DO UPDATE SET
+                   reference = excluded.reference,
+                   customer_name = excluded.customer_name,
+                   customer_email = excluded.customer_email,
+                   status_payment = excluded.status_payment,
+                   status_shipping = excluded.status_shipping,
+                   total = excluded.total,
+                   payment_method = excluded.payment_method,
+                   updated_at = excluded.updated_at,
+                   cached_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    int(remote["remote_id"]),
+                    remote.get("reference"),
+                    remote.get("customer_name"),
+                    remote.get("customer_email"),
+                    remote.get("status_payment"),
+                    remote.get("status_shipping"),
+                    float(remote.get("total") or 0),
+                    remote.get("payment_method"),
+                    remote.get("created_at"),
+                    remote.get("updated_at"),
+                ),
+            )
+
+    def cache_remote_inventory(self, remote):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO remote_inventory_cache
+                  (remote_id, sku, product_name, tipo, quantity_delta,
+                   stock_anterior, stock_nuevo, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(remote_id) DO UPDATE SET
+                   sku = excluded.sku,
+                   product_name = excluded.product_name,
+                   tipo = excluded.tipo,
+                   quantity_delta = excluded.quantity_delta,
+                   stock_anterior = excluded.stock_anterior,
+                   stock_nuevo = excluded.stock_nuevo,
+                   reason = excluded.reason,
+                   created_at = excluded.created_at,
+                   cached_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    int(remote["remote_id"]),
+                    remote.get("sku"),
+                    remote.get("product_name"),
+                    remote.get("tipo"),
+                    int(remote.get("quantity_delta") or 0),
+                    remote.get("stock_anterior"),
+                    remote.get("stock_nuevo"),
+                    remote.get("reason"),
+                    remote.get("created_at"),
+                ),
+            )
+
+    def list_remote_sales(self, limit=200):
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM remote_sales_cache ORDER BY updated_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_remote_inventory(self, limit=200):
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM remote_inventory_cache ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def _init_schema(self):
         with self.connect() as conn:
@@ -679,13 +892,54 @@ class LocalStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS generos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    nombre TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS remote_sales_cache (
+                    remote_id INTEGER PRIMARY KEY,
+                    reference TEXT,
+                    customer_name TEXT,
+                    customer_email TEXT,
+                    status_payment TEXT,
+                    status_shipping TEXT,
+                    total REAL,
+                    payment_method TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS remote_inventory_cache (
+                    remote_id INTEGER PRIMARY KEY,
+                    sku TEXT,
+                    product_name TEXT,
+                    tipo TEXT,
+                    quantity_delta INTEGER,
+                    stock_anterior INTEGER,
+                    stock_nuevo INTEGER,
+                    reason TEXT,
+                    created_at TEXT,
+                    cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
             # Migraciones idempotentes (ALTER TABLE no es opcional en SQLite si la columna ya existe).
             self._ensure_column(conn, "products", "barcode", "TEXT")
+            self._ensure_column(conn, "products", "image_path", "TEXT")
+            self._ensure_column(conn, "products", "genero_id", "INTEGER")
+            self._ensure_column(conn, "products", "remote_id", "INTEGER")
             self._ensure_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "remote_id", "INTEGER")
+            self._ensure_column(conn, "users", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_remote_id ON products(remote_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_remote_id ON users(remote_id)")
 
             conn.executescript(
                 """

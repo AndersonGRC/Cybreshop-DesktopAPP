@@ -49,12 +49,38 @@ class SyncClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/api/v1/sync/health")
 
-    def pull_products(self, since: str | None = None, limit: int = 1000) -> dict[str, Any]:
+    def pull_products(self, since: str | None = None, limit: int = 1000,
+                      include_inactive: bool = True) -> dict[str, Any]:
         params = {"limit": int(limit)}
         if since:
             params["since"] = since
-        path = f"/api/v1/sync/products?{urlencode(params)}"
-        return self._request("GET", path)
+        if include_inactive:
+            params["include_inactive"] = 1
+        return self._request("GET", f"/api/v1/sync/products?{urlencode(params)}")
+
+    def pull_users(self, since: str | None = None, limit: int = 500) -> dict[str, Any]:
+        params = {"limit": int(limit)}
+        if since:
+            params["since"] = since
+        return self._request("GET", f"/api/v1/sync/users?{urlencode(params)}")
+
+    def pull_generos(self, since: str | None = None, limit: int = 500) -> dict[str, Any]:
+        params = {"limit": int(limit)}
+        if since:
+            params["since"] = since
+        return self._request("GET", f"/api/v1/sync/generos?{urlencode(params)}")
+
+    def pull_sales_web(self, since: str | None = None, limit: int = 200) -> dict[str, Any]:
+        params = {"limit": int(limit)}
+        if since:
+            params["since"] = since
+        return self._request("GET", f"/api/v1/sync/sales_web?{urlencode(params)}")
+
+    def pull_inventory_log(self, since: str | None = None, limit: int = 500) -> dict[str, Any]:
+        params = {"limit": int(limit)}
+        if since:
+            params["since"] = since
+        return self._request("GET", f"/api/v1/sync/inventory_log?{urlencode(params)}")
 
     def push_outbox(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/sync/outbox", body={"items": items})

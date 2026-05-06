@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -650,18 +651,43 @@ class ProductsPage(QWidget):
         self.price.setDecimals(2)
         self.price.setPrefix("$")
 
+        # Genero (combo desde tabla generos local sincronizada)
+        self.genero_combo = QComboBox()
+        self.genero_combo.addItem("(sin genero)", None)
+        for g in self.store.list_generos():
+            self.genero_combo.addItem(g["nombre"], g.get("remote_id") or g["id"])
+
+        # Imagen
+        self.image_path = QLineEdit()
+        self.image_path.setPlaceholderText("Ruta a imagen (opcional). Web usara placeholder si vacio.")
+        browse_img = QPushButton("Examinar...")
+        browse_img.setObjectName("secondaryAction")
+        browse_img.clicked.connect(self._browse_image)
+        clear_img = QPushButton("Quitar")
+        clear_img.setObjectName("dangerAction")
+        clear_img.clicked.connect(lambda: self.image_path.setText(""))
+        image_row = QHBoxLayout()
+        image_row.addWidget(self.image_path, 1)
+        image_row.addWidget(browse_img)
+        image_row.addWidget(clear_img)
+
         fields = [
             ("SKU", self.sku),
             ("Codigo de barras", self.barcode),
             ("Nombre", self.name),
-            ("Categoria", self.category),
+            ("Categoria (libre)", self.category),
             ("Stock", self.stock),
             ("Minimo", self.min_stock),
             ("Precio", self.price),
+            ("Genero (sync con web)", self.genero_combo),
         ]
         for index, (label, widget) in enumerate(fields):
             form_layout.addWidget(QLabel(label), index // 3 * 2, index % 3)
             form_layout.addWidget(widget, index // 3 * 2 + 1, index % 3)
+        # Imagen ocupa toda la fila siguiente
+        next_row = ((len(fields) - 1) // 3 + 1) * 2
+        form_layout.addWidget(QLabel("Imagen"), next_row, 0)
+        form_layout.addLayout(image_row, next_row + 1, 0, 1, 3)
 
         actions = QHBoxLayout()
         save = QPushButton("Guardar producto")
@@ -703,7 +729,24 @@ class ProductsPage(QWidget):
 
     def refresh(self):
         self._all_products = self.store.products()
+        # Refrescar combo de generos (puede haber cambios desde sync)
+        current_g = self.genero_combo.currentData()
+        self.genero_combo.clear()
+        self.genero_combo.addItem("(sin genero)", None)
+        for g in self.store.list_generos():
+            self.genero_combo.addItem(g["nombre"], g.get("remote_id") or g["id"])
+        if current_g is not None:
+            idx = self.genero_combo.findData(current_g)
+            if idx >= 0:
+                self.genero_combo.setCurrentIndex(idx)
         self._apply_filter()
+
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Elegir imagen", "", "Imagenes (*.png *.jpg *.jpeg *.webp)"
+        )
+        if path:
+            self.image_path.setText(path)
 
     def _apply_filter(self):
         needle = self.search.text().strip().lower()
@@ -750,6 +793,19 @@ class ProductsPage(QWidget):
         self.stock.setValue(int(self.table.item(row, 5).text()))
         self.min_stock.setValue(int(self.table.item(row, 6).text()))
         self.price.setValue(float(self.table.item(row, 7).text()))
+        # Cargar imagen y genero del producto seleccionado
+        prod = next((p for p in self._all_products if p["id"] == self.selected_id), None)
+        if prod:
+            self.image_path.setText(prod.get("image_path") or "")
+            gid = prod.get("genero_id")
+            if gid is not None:
+                idx = self.genero_combo.findData(gid)
+                if idx >= 0:
+                    self.genero_combo.setCurrentIndex(idx)
+                else:
+                    self.genero_combo.setCurrentIndex(0)
+            else:
+                self.genero_combo.setCurrentIndex(0)
 
     def _save(self):
         if not self.sku.text().strip() or not self.name.text().strip():
@@ -765,6 +821,8 @@ class ProductsPage(QWidget):
                 self.min_stock.value(),
                 self.price.value(),
                 barcode=self.barcode.text().strip(),
+                image_path=self.image_path.text().strip(),
+                genero_id=self.genero_combo.currentData(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "Producto", str(exc))
@@ -798,6 +856,8 @@ class ProductsPage(QWidget):
         self.stock.setValue(0)
         self.min_stock.setValue(0)
         self.price.setValue(0)
+        self.image_path.clear()
+        self.genero_combo.setCurrentIndex(0)
 
 
 # =============================================================================
@@ -1282,17 +1342,45 @@ class SalesPage(QWidget):
         actions.addStretch(1)
         layout.addLayout(actions)
 
+        # Tabs: ventas locales (POS desktop) y ventas web (pedidos)
+        self.tabs = QTabWidget()
+
+        # Tab 1: ventas locales (lo que habia antes)
+        local_widget = QWidget()
+        local_layout = QVBoxLayout(local_widget)
+        local_layout.setContentsMargins(0, 8, 0, 0)
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["ID", "Recibo", "Fecha", "Items", "Total"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
         self.table.itemDoubleClicked.connect(self._open_detail)
-        layout.addWidget(self.table)
+        local_layout.addWidget(self.table)
+        local_hint = QLabel("Doble click sobre una fila para ver el detalle del recibo.")
+        local_hint.setObjectName("muted")
+        local_layout.addWidget(local_hint)
+        self.tabs.addTab(local_widget, "Ventas POS desktop")
 
-        hint = QLabel("Doble click sobre una fila para ver el detalle del recibo.")
-        hint.setObjectName("muted")
-        layout.addWidget(hint)
+        # Tab 2: ventas web (cache de pedidos PayU)
+        remote_widget = QWidget()
+        remote_layout = QVBoxLayout(remote_widget)
+        remote_layout.setContentsMargins(0, 8, 0, 0)
+        self.remote_table = QTableWidget()
+        self.remote_table.setColumnCount(7)
+        self.remote_table.setHorizontalHeaderLabels(
+            ["ID", "Referencia", "Cliente", "Pago", "Envio", "Total", "Fecha"]
+        )
+        self.remote_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.remote_table.setAlternatingRowColors(True)
+        remote_layout.addWidget(self.remote_table)
+        remote_hint = QLabel(
+            "Pedidos del ecommerce web. Se actualiza con la sincronizacion automatica (F7)."
+        )
+        remote_hint.setObjectName("muted")
+        remote_layout.addWidget(remote_hint)
+        self.tabs.addTab(remote_widget, "Pedidos web (read-only)")
+
+        layout.addWidget(self.tabs)
         self.refresh()
 
     def refresh(self):
@@ -1321,6 +1409,22 @@ class SalesPage(QWidget):
                 if col_index == 0:
                     item.setData(Qt.ItemDataRole.UserRole, sale["id"])
                 self.table.setItem(row_index, col_index, item)
+
+        # Pedidos web (cache)
+        remote = self.store.list_remote_sales(limit=200)
+        self.remote_table.setRowCount(len(remote))
+        for row_index, r in enumerate(remote):
+            values = [
+                r["remote_id"],
+                r.get("reference") or "",
+                r.get("customer_name") or "",
+                r.get("status_payment") or "",
+                r.get("status_shipping") or "",
+                f"${(r.get('total') or 0):,.0f}",
+                r.get("updated_at") or "",
+            ]
+            for col_index, value in enumerate(values):
+                self.remote_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
 
     def _open_detail(self, item):
         row = item.row()
@@ -1791,25 +1895,27 @@ class SyncPage(QWidget):
 
     def _sync_now_clicked(self):
         try:
-            applied, pulled, errors = self._do_sync()
+            stats = self._do_sync()
         except (ValueError, SyncError) as exc:
             self._record_status(f"error: {exc}")
             self._set_status_text(f"Sync fallo: {exc}", error=True)
             return
-        msg = f"Sync OK: {pulled} producto(s) bajaron, {applied} item(s) subieron"
-        if errors:
-            msg += f", {errors} con error en server"
-        self._record_status("ok" + (f" ({errors} errores)" if errors else ""))
-        self._set_status_text(msg, error=False)
+        msg = self._format_stats(stats)
+        suffix = ""
+        if stats["pushed_errors"]:
+            suffix = f" ({stats['pushed_errors']} errores)"
+        self._record_status("ok" + suffix)
+        self._set_status_text(msg, error=stats["pushed_errors"] > 0)
         self.refresh()
         self.on_changed()
 
     def _sync_now_silent(self):
-        """Variante para timer automatico: no muestra QMessageBox, solo actualiza estado."""
+        """Variante para timer automatico: no muestra dialogos."""
         try:
-            applied, pulled, errors = self._do_sync()
-            self._record_status("ok" + (f" ({errors} errores)" if errors else ""))
-            self.sync_status.setText(self._format_status() + f" - {pulled} bajaron, {applied} subieron")
+            stats = self._do_sync()
+            suffix = f" ({stats['pushed_errors']} errores)" if stats["pushed_errors"] else ""
+            self._record_status("ok" + suffix)
+            self.sync_status.setText(self._format_status() + " | " + self._format_stats(stats))
             self.refresh()
             self.on_changed()
         except (ValueError, SyncError) as exc:
@@ -1817,43 +1923,147 @@ class SyncPage(QWidget):
             self.sync_status.setText(self._format_status())
             self.sync_status.setStyleSheet("color: #b42318;")
 
-    def _do_sync(self):
-        """Ejecuta pull productos + push outbox. Retorna (applied, pulled, errors)."""
-        client = self._build_client()
-        # Pull
-        since = self._sync_state.get("last_pull_at") or None
-        pull_resp = client.pull_products(since=since, limit=500)
-        pulled = 0
-        for remote in pull_resp.get("items", []):
-            try:
-                self.store.upsert_product_from_remote(remote)
-                pulled += 1
-            except Exception as exc:  # noqa: BLE001
-                # No frenar el pull entero por un producto malo
-                print(f"[sync] upsert fallo para {remote.get('sku')}: {exc}")
-        if pull_resp.get("cursor"):
-            sync_cfg.update(self._base_dir, last_pull_at=pull_resp["cursor"])
-            self._sync_state["last_pull_at"] = pull_resp["cursor"]
+    def _format_stats(self, stats):
+        pulled_total = (stats["pulled_products"] + stats["pulled_users"] +
+                        stats["pulled_generos"] + stats["pulled_sales_web"] +
+                        stats["pulled_inventory_log"])
+        parts = [
+            f"{pulled_total} bajaron",
+            f"{stats['pushed_applied']} subieron",
+        ]
+        if stats["pushed_stale"]:
+            parts.append(f"{stats['pushed_stale']} descartados (server tenia version mas nueva)")
+        if stats["pushed_errors"]:
+            parts.append(f"{stats['pushed_errors']} errores")
+        return ", ".join(parts)
 
-        # Push
+    def _do_sync(self):
+        """Ejecuta sync bidireccional completo.
+
+        Orden:
+        1. Pull generos (FK necesaria para productos).
+        2. Pull productos (con include_inactive para tombstones).
+        3. Pull usuarios (perfil).
+        4. Pull pedidos web (cache).
+        5. Pull inventory_log web (cache).
+        6. Push outbox (sale, inventory_movement, product, user).
+
+        Retorna dict con conteos por categoria.
+        """
+        client = self._build_client()
+        stats = {"pulled_generos": 0, "pulled_products": 0, "pulled_users": 0,
+                 "pulled_sales_web": 0, "pulled_inventory_log": 0,
+                 "pushed_applied": 0, "pushed_skipped": 0, "pushed_stale": 0,
+                 "pushed_errors": 0}
+
+        # --- Pull generos ---
+        try:
+            r = client.pull_generos(since=self._sync_state.get("cursor_generos") or None)
+            for g in r.get("items", []):
+                try:
+                    self.store.upsert_genero_from_remote(g)
+                    stats["pulled_generos"] += 1
+                except Exception as exc:
+                    print(f"[sync] genero fallo: {exc}")
+            if r.get("cursor"):
+                sync_cfg.update(self._base_dir, cursor_generos=r["cursor"])
+                self._sync_state["cursor_generos"] = r["cursor"]
+        except SyncError as exc:
+            print(f"[sync] pull_generos: {exc}")
+
+        # --- Pull productos (incluyendo tombstones) ---
+        try:
+            since = self._sync_state.get("cursor_products") or self._sync_state.get("last_pull_at") or None
+            r = client.pull_products(since=since, limit=500, include_inactive=True)
+            for p in r.get("items", []):
+                try:
+                    self.store.upsert_product_from_remote(p)
+                    stats["pulled_products"] += 1
+                except Exception as exc:
+                    print(f"[sync] producto fallo {p.get('sku')}: {exc}")
+            if r.get("cursor"):
+                sync_cfg.update(self._base_dir, cursor_products=r["cursor"], last_pull_at=r["cursor"])
+                self._sync_state["cursor_products"] = r["cursor"]
+        except SyncError as exc:
+            print(f"[sync] pull_products: {exc}")
+
+        # --- Pull usuarios ---
+        try:
+            r = client.pull_users(since=self._sync_state.get("cursor_users") or None)
+            for u in r.get("items", []):
+                try:
+                    self.store.upsert_user_from_remote(u)
+                    stats["pulled_users"] += 1
+                except Exception as exc:
+                    print(f"[sync] user fallo: {exc}")
+            if r.get("cursor"):
+                sync_cfg.update(self._base_dir, cursor_users=r["cursor"])
+                self._sync_state["cursor_users"] = r["cursor"]
+        except SyncError as exc:
+            print(f"[sync] pull_users: {exc}")
+
+        # --- Pull pedidos web (cache read-only) ---
+        try:
+            r = client.pull_sales_web(since=self._sync_state.get("cursor_sales_web") or None)
+            for s in r.get("items", []):
+                try:
+                    self.store.cache_remote_sale(s)
+                    stats["pulled_sales_web"] += 1
+                except Exception as exc:
+                    print(f"[sync] sale_web fallo: {exc}")
+            if r.get("cursor"):
+                sync_cfg.update(self._base_dir, cursor_sales_web=r["cursor"])
+                self._sync_state["cursor_sales_web"] = r["cursor"]
+        except SyncError as exc:
+            print(f"[sync] pull_sales_web: {exc}")
+
+        # --- Pull inventory_log web (cache) ---
+        try:
+            r = client.pull_inventory_log(since=self._sync_state.get("cursor_inventory_log") or None)
+            for i in r.get("items", []):
+                try:
+                    self.store.cache_remote_inventory(i)
+                    stats["pulled_inventory_log"] += 1
+                except Exception as exc:
+                    print(f"[sync] inv_log fallo: {exc}")
+            if r.get("cursor"):
+                sync_cfg.update(self._base_dir, cursor_inventory_log=r["cursor"])
+                self._sync_state["cursor_inventory_log"] = r["cursor"]
+        except SyncError as exc:
+            print(f"[sync] pull_inventory_log: {exc}")
+
+        # --- Push outbox ---
         pending = self.store.pending_outbox(limit=100)
-        applied = 0
-        errors = 0
         if pending:
             push_payload = [
                 {"local_id": p["id"], "entity": p["entity"], "action": p["action"], "payload": p["payload"]}
                 for p in pending
             ]
-            push_resp = client.push_outbox(push_payload)
-            done_ids = []
-            for r in push_resp.get("results", []):
-                if r["status"] in ("applied", "skipped"):
-                    done_ids.append(r["local_id"])
-                    applied += 1
-                else:
-                    errors += 1
-            self.store.mark_outbox_synced(done_ids)
-        return applied, pulled, errors
+            try:
+                push_resp = client.push_outbox(push_payload)
+                done_ids = []
+                for r in push_resp.get("results", []):
+                    status = r.get("status")
+                    if status == "applied":
+                        done_ids.append(r["local_id"])
+                        stats["pushed_applied"] += 1
+                    elif status == "skipped":
+                        done_ids.append(r["local_id"])
+                        stats["pushed_skipped"] += 1
+                    elif status == "stale":
+                        # LWW perdio: marcar como sync (descartar) y confiar en pull proximo
+                        done_ids.append(r["local_id"])
+                        stats["pushed_stale"] += 1
+                    else:
+                        stats["pushed_errors"] += 1
+                self.store.mark_outbox_synced(done_ids)
+            except SyncError as exc:
+                print(f"[sync] push_outbox: {exc}")
+                stats["pushed_errors"] += len(pending)
+
+        # Persistir contador de stale para mostrar en UI
+        sync_cfg.update(self._base_dir, last_stale_count=str(stats["pushed_stale"]))
+        return stats
 
     def _record_status(self, status_text):
         from datetime import datetime

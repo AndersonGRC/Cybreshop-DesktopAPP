@@ -25,9 +25,15 @@ DEFAULTS: dict[str, Any] = {
     "api_key": "",
     "enabled": False,
     "interval_sec": 30,
-    "last_pull_at": "",
+    "last_pull_at": "",          # legacy (cursor productos)
+    "cursor_products": "",
+    "cursor_users": "",
+    "cursor_generos": "",
+    "cursor_sales_web": "",
+    "cursor_inventory_log": "",
     "last_sync_status": "",
     "last_sync_at": "",
+    "last_stale_count": "0",
 }
 
 CONFIG_FILE = "sync_config.json"
