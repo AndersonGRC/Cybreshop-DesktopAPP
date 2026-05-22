@@ -21,6 +21,12 @@ desktop_native_data/
 *.db-journal
 *.sqlite
 *.sqlite3
+.cybershop.conf
+
+# Logs de depuracion y temporales
+_dbg_*.log
+*.log
+.gittmp/
 
 # IDE
 .vscode/

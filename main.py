@@ -4,8 +4,9 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QKeyEvent, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtGui import QAction, QIcon, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QColorDialog,
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -31,188 +33,454 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 import branding as branding_mod
+import cybershop_conf as install_conf
 import sync_config as sync_cfg
 from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "1.0.0"
 ROLES = ["Administrador", "Cajero", "Inventario"]
+
+
+def _asset_path(name: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / "assets" / name
+
+
+def _default_app_icon() -> QIcon:
+    ico = _asset_path("cybershop.ico")
+    if ico.is_file():
+        return QIcon(str(ico))
+    png = _asset_path("cybershop.png")
+    return QIcon(str(png)) if png.is_file() else QIcon()
+
+
+def _version_cmp(a: str, b: str) -> int:
+    """Compara dos versiones tipo '1.2.3'. Devuelve -1, 0, 1 (a < b, a == b, a > b).
+    Tolerante a partes no numéricas y diferentes longitudes."""
+    def parse(v):
+        out = []
+        for chunk in (v or "").split("."):
+            try:
+                out.append(int(chunk))
+            except ValueError:
+                # parte no numérica → tratar como 0 + sufijo string
+                out.append(0)
+        return out
+    pa, pb = parse(a), parse(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa))
+    pb += [0] * (n - len(pb))
+    if pa < pb:
+        return -1
+    if pa > pb:
+        return 1
+    return 0
+
+
+def _now_iso_local() -> str:
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
 
 
 # =============================================================================
 # Stylesheet template (con placeholders $primario, etc.)
 # =============================================================================
 QSS_TEMPLATE = """
+/* ═══════════════════════════════════════════════════════════════
+   CyberShop POS Desktop — Design System
+   Tokens (vienen de branding.json):
+     $primario, $primario_oscuro, $acento, $acento_secundario,
+     $peligro, $sidebar_inicio, $sidebar_fin, $fondo
+     y sus _rgb (R, G, B) para usar en rgba().
+   Convenciones:
+     - Radios: 8px chips, 12px botones/inputs, 16-22px tarjetas
+     - Pesos: 500 cuerpo, 600 etiquetas, 700 labels destacados,
+              800 títulos de sección, 850 hero/metric values
+     - Tipografía: Segoe UI Variable cuando esté, fallback a Segoe UI
+   ════════════════════════════════════════════════════════════════ */
+
+/* ─── Base ──────────────────────────────────────────────────────── */
 QWidget {
-    font-family: "Segoe UI", Tahoma, sans-serif;
+    font-family: "Segoe UI Variable Display", "Segoe UI", Tahoma, sans-serif;
     font-size: 14px;
-    color: #333333;
+    color: #1f2937;
     background: $fondo;
 }
+QToolTip {
+    background: #1f2937;
+    color: #f9fafb;
+    border: 0;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+/* ─── Sidebar ───────────────────────────────────────────────────── */
 QFrame#sidebar {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 $sidebar_inicio,
         stop:1 $sidebar_fin
     );
+    border-right: 1px solid rgba(0,0,0,0.18);
 }
+/* Todos los QLabel dentro del sidebar deben ser transparentes
+   para que el degradado azul de QFrame#sidebar se vea por debajo
+   y el texto blanco no quede oculto por el fondo cream global. */
+QFrame#sidebar QLabel { background: transparent; }
+QFrame#userCard QLabel { background: transparent; }
 QLabel#brand {
     color: #ffffff;
+    background: transparent;
     font-size: 22px;
     font-weight: 800;
+    letter-spacing: 0.2px;
+    padding: 2px 0 0 2px;
 }
-QLabel#offlineBadge {
-    color: #ffffff;
-    background: rgba(255,255,255,0.12);
-    border: 1px solid rgba(255,255,255,0.18);
-    border-radius: 10px;
-    padding: 7px 9px;
-    font-size: 12px;
+QLabel#brandSubtitle {
+    color: rgba(255,255,255,0.92);
+    background: transparent;
+    font-size: 11px;
     font-weight: 700;
+    letter-spacing: 2.2px;
+    text-transform: uppercase;
+    padding: 0 0 10px 2px;
+}
+QLabel#sidebarSection {
+    color: rgba(255,255,255,0.95);
+    background: transparent;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 2.0px;
+    text-transform: uppercase;
+    padding: 16px 8px 6px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.10);
+    margin: 0 4px 4px 4px;
+}
+QLabel#syncBadge {
+    color: #ffffff;
+    background: rgba(255,255,255,0.10);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+QLabel#syncBadge[state="online"] {
+    background: rgba($acento_secundario_rgb, 0.22);
+    border: 1px solid rgba($acento_secundario_rgb, 0.45);
+}
+QLabel#syncBadge[state="syncing"] {
+    background: rgba(255, 184, 0, 0.20);
+    border: 1px solid rgba(255, 184, 0, 0.45);
+}
+QLabel#syncBadge[state="offline"] {
+    background: rgba($peligro_rgb, 0.20);
+    border: 1px solid rgba($peligro_rgb, 0.45);
+    color: #ffe7e2;
 }
 QFrame#userCard {
     background: rgba(255,255,255,0.10);
-    border: 1px solid rgba(255,255,255,0.16);
+    border: 1px solid rgba(255,255,255,0.20);
     border-radius: 12px;
+}
+QLabel#userAvatar {
+    background: $acento;
+    color: #ffffff;
+    border-radius: 18px;
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    font-size: 14px;
+    font-weight: 850;
+    letter-spacing: 0.2px;
 }
 QLabel#userName {
     color: #ffffff;
-    font-size: 14px;
+    background: transparent;
+    font-size: 13px;
     font-weight: 800;
+    letter-spacing: 0.1px;
 }
 QLabel#userRole {
-    color: rgba(255,255,255,0.75);
+    color: rgba(255,255,255,0.78);
+    background: transparent;
     font-size: 11px;
     font-weight: 600;
 }
-QPushButton#navButton, QPushButton#logoutButton {
+QPushButton#navButton {
+    text-align: left;
+    border: 0;
+    border-left: 3px solid transparent;
+    border-radius: 10px;
+    padding: 9px 12px 9px 14px;
+    background: transparent;
+    color: rgba(255,255,255,0.92);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    min-height: 34px;
+}
+QPushButton#navButton:hover {
+    background: rgba(255,255,255,0.12);
+    color: #ffffff;
+}
+QPushButton#navButton[active="true"] {
+    background: rgba(255,255,255,0.22);
+    color: #ffffff;
+    border-left: 3px solid $acento;
+    font-weight: 800;
+}
+QPushButton#logoutButton {
     text-align: left;
     border: 0;
     border-radius: 12px;
     padding: 12px 14px;
     background: transparent;
-    color: rgba(255,255,255,0.82);
+    color: rgba(255, 230, 226, 0.95);
     font-weight: 650;
 }
-QPushButton#navButton:hover, QPushButton#navButton[active="true"] {
-    background: rgba(255,255,255,0.12);
+QPushButton#logoutButton:hover {
+    background: rgba($peligro_rgb, 0.28);
     color: #ffffff;
-    border-left: 3px solid $acento;
 }
-QPushButton#logoutButton {
-    color: #ffd8d3;
-}
+
+/* ─── Footer ────────────────────────────────────────────────────── */
 QFrame#footer {
     background: #ffffff;
-    border-top: 1px solid #e3e6f0;
+    border-top: 1px solid #e5e7eb;
 }
 QLabel#footerText {
-    color: #5a5c69;
+    color: #6b7280;
     font-size: 11px;
+    font-weight: 500;
 }
+
+/* ─── Tipografía ────────────────────────────────────────────────── */
 QLabel#pageTitle {
-    font-size: 28px;
+    font-size: 26px;
     font-weight: 800;
     color: $primario_oscuro;
+    letter-spacing: -0.3px;
+    padding-bottom: 2px;
+}
+QLabel#pageSubtitle {
+    color: #6b7280;
+    font-size: 13px;
+    font-weight: 500;
 }
 QLabel#muted {
-    color: #5a5c69;
-    line-height: 1.5;
+    color: #6b7280;
+    line-height: 1.55;
 }
 QLabel#eyebrow {
     color: $primario;
-    font-size: 12px;
-    font-weight: 850;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.6px;
     text-transform: uppercase;
 }
 QLabel#eyebrowMuted {
-    color: #5a5c69;
-    font-size: 11px;
+    color: #6b7280;
+    font-size: 10px;
     font-weight: 800;
+    letter-spacing: 1.4px;
     text-transform: uppercase;
 }
 QLabel#heroTitle {
     color: $primario_oscuro;
-    font-size: 22px;
-    font-weight: 850;
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: -0.1px;
 }
 QLabel#highlightText {
     color: $primario_oscuro;
-    font-size: 14px;
-    font-weight: 800;
+    font-size: 13px;
+    font-weight: 750;
 }
+
+/* ─── Tarjetas y paneles ────────────────────────────────────────── */
 QFrame#metricCard, QFrame#sectionPanel, QFrame#loginCard {
     background: #ffffff;
-    border: 1px solid rgba($primario_rgb, 0.08);
-    border-radius: 18px;
+    border: 1px solid rgba($primario_rgb, 0.16);
+    border-radius: 14px;
 }
+QFrame#metricCard {
+    border-radius: 12px;
+}
+QFrame#metricCard:hover {
+    border-color: rgba($primario_rgb, 0.32);
+}
+QLabel#metricValue {
+    font-size: 26px;
+    font-weight: 850;
+    color: $primario;
+    letter-spacing: -0.3px;
+}
+QLabel#metricValue[state="empty"] {
+    color: #9ca3af;
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#metricLabel {
+    color: #6b7280;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+}
+
+/* ─── Dashboard hero ────────────────────────────────────────────── */
+QFrame#dashboardHero {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #ffffff,
+        stop:1 rgba($primario_rgb, 0.05)
+    );
+    border: 1px solid rgba($primario_rgb, 0.18);
+    border-radius: 14px;
+}
+QFrame#heroHighlight {
+    background: rgba($primario_rgb, 0.06);
+    border: 1px solid rgba($primario_rgb, 0.18);
+    border-left: 3px solid $acento;
+    border-radius: 10px;
+}
+
+/* ─── Module grid (atajos a módulos) ─────────────────────────── */
+QFrame#moduleCard {
+    background: #ffffff;
+    border: 1px solid rgba($primario_rgb, 0.16);
+    border-radius: 12px;
+}
+QFrame#moduleCard:hover {
+    border-color: rgba($primario_rgb, 0.40);
+    background: rgba($primario_rgb, 0.04);
+}
+QLabel#moduleCardIcon {
+    background: rgba($primario_rgb, 0.10);
+    color: $primario;
+    border-radius: 10px;
+    min-width: 38px;
+    max-width: 38px;
+    min-height: 38px;
+    max-height: 38px;
+    font-size: 18px;
+    font-weight: 800;
+}
+QLabel#moduleCardTitle {
+    color: $primario_oscuro;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.1px;
+}
+QLabel#moduleCardDetail {
+    color: #6b7280;
+    font-size: 11px;
+    font-weight: 600;
+}
+QLabel#moduleCardShortcut {
+    color: #9ca3af;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.0px;
+}
+
+/* ─── POS scanner ───────────────────────────────────────────────── */
 QFrame#scannerPanel {
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:0,
         stop:0 $primario,
         stop:1 $primario_oscuro
     );
-    border-radius: 16px;
+    border-radius: 18px;
     border: 1px solid rgba($acento_secundario_rgb, 0.45);
 }
-QFrame#scannerPanel QLabel {
-    color: #ffffff;
-}
+QFrame#scannerPanel QLabel { color: #ffffff; }
 QLabel#scannerIcon {
     color: $acento_secundario;
     font-family: "Consolas", monospace;
-    font-size: 24px;
+    font-size: 26px;
     font-weight: 900;
     letter-spacing: 1px;
 }
 QLineEdit#barcodeInput {
-    background: rgba(255,255,255,0.96);
+    background: rgba(255,255,255,0.97);
     border: 2px solid $acento_secundario;
     border-radius: 12px;
     padding: 6px 14px;
     font-size: 16px;
-    font-weight: 750;
+    font-weight: 700;
     color: $primario_oscuro;
-    min-height: 40px;
+    min-height: 42px;
 }
 QLineEdit#barcodeInput:focus {
     border-color: $acento;
     background: #ffffff;
 }
 QLabel#scannerBadge {
-    background: rgba(160, 160, 160, 0.18);
-    color: #5a5c69;
-    border: 1px solid rgba(160, 160, 160, 0.5);
+    background: rgba(160,160,160,0.18);
+    color: #6b7280;
+    border: 1px solid rgba(160,160,160,0.45);
     border-radius: 999px;
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 800;
+    letter-spacing: 0.4px;
     text-transform: uppercase;
 }
 QLabel#scannerBadge[state="on"] {
-    background: rgba($acento_secundario_rgb, 0.18);
+    background: rgba($acento_secundario_rgb, 0.20);
     color: #5a7a14;
-    border: 1px solid rgba($acento_secundario_rgb, 0.5);
+    border: 1px solid rgba($acento_secundario_rgb, 0.55);
 }
 QLabel#scannerBadge[state="off"] {
-    background: rgba($peligro_rgb, 0.10);
+    background: rgba($peligro_rgb, 0.12);
     color: $peligro;
-    border: 1px solid rgba($peligro_rgb, 0.30);
+    border: 1px solid rgba($peligro_rgb, 0.32);
+}
+
+/* ─── Botones ───────────────────────────────────────────────────── */
+QPushButton {
+    min-height: 42px;
+    border: 0;
+    border-radius: 12px;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 $primario,
+        stop:1 $primario_oscuro
+    );
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    padding: 0 16px;
+}
+QPushButton:hover { background: $primario_oscuro; }
+QPushButton:pressed { background: $primario_oscuro; padding-top: 1px; }
+QPushButton:disabled {
+    background: #f3f4f6;
+    color: #6b7280;
+    border: 1px solid #e5e7eb;
 }
 QPushButton#primaryAction {
     background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:1,
+        x1:0, y1:0, x2:0, y2:1,
         stop:0 $acento_secundario,
         stop:1 $acento_secundario
     );
     color: $primario_oscuro;
-    font-weight: 850;
+    font-weight: 800;
 }
 QPushButton#primaryAction:hover {
     background: $acento_secundario;
@@ -220,22 +488,26 @@ QPushButton#primaryAction:hover {
 }
 QPushButton#secondaryAction {
     background: transparent;
-    border: 1px solid rgba($primario_rgb, 0.30);
+    border: 1px solid rgba($primario_rgb, 0.32);
     color: $primario;
+    font-weight: 650;
 }
 QPushButton#secondaryAction:hover {
     background: rgba($primario_rgb, 0.08);
+    border-color: $primario;
 }
 QPushButton#dangerAction {
     background: transparent;
     border: 1px solid rgba($peligro_rgb, 0.40);
     color: $peligro;
+    font-weight: 650;
 }
 QPushButton#dangerAction:hover {
-    background: rgba($peligro_rgb, 0.08);
+    background: rgba($peligro_rgb, 0.10);
+    border-color: $peligro;
 }
 QPushButton#inlineDanger {
-    background: rgba($peligro_rgb, 0.08);
+    background: rgba($peligro_rgb, 0.10);
     color: $peligro;
     border: 1px solid rgba($peligro_rgb, 0.30);
     border-radius: 8px;
@@ -243,95 +515,210 @@ QPushButton#inlineDanger {
     padding: 0 10px;
     font-weight: 700;
 }
-QPushButton#inlineDanger:hover {
-    background: rgba($peligro_rgb, 0.16);
-}
-QFrame#dashboardHero {
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:1,
-        stop:0 rgba(255,255,255,0.98),
-        stop:1 rgba($primario_rgb, 0.04)
-    );
-    border: 1px solid rgba($primario_rgb, 0.10);
-    border-radius: 22px;
-}
-QFrame#heroHighlight {
-    background: rgba($primario_rgb, 0.06);
-    border: 1px solid rgba($primario_rgb, 0.10);
-    border-radius: 16px;
-}
-QLabel#metricValue {
-    font-size: 24px;
-    font-weight: 850;
-    color: $primario;
-}
-QPushButton#moduleButton {
-    min-height: 82px;
-    text-align: left;
-    border: 1px solid rgba($primario_rgb, 0.08);
-    border-radius: 18px;
-    padding: 14px;
-    background: rgba(255,255,255,0.94);
-    color: $primario_oscuro;
-    font-weight: 750;
-}
-QPushButton#moduleButton:hover {
-    border-color: rgba($primario_rgb, 0.18);
-    background: rgba($primario_rgb, 0.05);
-    color: $primario;
-}
+QPushButton#inlineDanger:hover { background: rgba($peligro_rgb, 0.18); }
+
+/* ─── Login ─────────────────────────────────────────────────────── */
 QWidget#loginRoot {
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:1,
         stop:0 $fondo,
-        stop:0.52 rgba($primario_rgb, 0.06),
+        stop:0.5 rgba($primario_rgb, 0.07),
         stop:1 $fondo
     );
 }
+QFrame#loginCard {
+    border-radius: 20px;
+    border: 1px solid rgba($primario_rgb, 0.20);
+}
 QLabel#loginTitle {
-    font-size: 24px;
+    font-size: 26px;
     font-weight: 850;
     color: $primario_oscuro;
+    letter-spacing: -0.3px;
 }
+QLabel#loginHint {
+    color: #4b5563;
+    font-size: 12px;
+    font-weight: 500;
+    background: rgba($primario_rgb, 0.06);
+    border: 1px solid rgba($primario_rgb, 0.18);
+    border-radius: 8px;
+    padding: 8px 12px;
+}
+
+/* ─── Inputs ────────────────────────────────────────────────────── */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    min-height: 38px;
-    border: 1px solid #e3e6f0;
-    border-radius: 10px;
-    padding: 0 10px;
+    min-height: 42px;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    padding: 0 12px;
     background: #ffffff;
+    color: #1f2937;
+    selection-background-color: rgba($primario_rgb, 0.30);
+    selection-color: #ffffff;
+}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
+    border-color: #9ca3af;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: $primario;
+    background: #ffffff;
 }
-QPushButton {
-    min-height: 40px;
-    border: 0;
-    border-radius: 12px;
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:1,
-        stop:0 $primario,
-        stop:1 $primario
-    );
-    color: #ffffff;
-    font-weight: 750;
-    padding: 0 14px;
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+    background: #f3f4f6;
+    color: #6b7280;
+    border-color: #e5e7eb;
 }
-QPushButton:hover {
-    background: $primario_oscuro;
+QCheckBox {
+    spacing: 8px;
+    font-weight: 600;
+    color: #374151;
 }
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid #d1d5db;
+    border-radius: 5px;
+    background: #ffffff;
+}
+QCheckBox::indicator:hover { border-color: $primario; }
+QCheckBox::indicator:checked {
+    background: $primario;
+    border-color: $primario;
+}
+
+/* ─── Tablas ────────────────────────────────────────────────────── */
 QTableWidget {
     background: #ffffff;
-    border: 1px solid rgba($primario_rgb, 0.08);
-    gridline-color: #e7edf4;
-    alternate-background-color: rgba($primario_rgb, 0.025);
+    border: 1px solid rgba($primario_rgb, 0.18);
+    border-radius: 12px;
+    gridline-color: #e5e7eb;
+    alternate-background-color: rgba($primario_rgb, 0.035);
+    selection-background-color: rgba($primario_rgb, 0.18);
+    selection-color: $primario_oscuro;
 }
+QTableWidget::item { padding: 8px 6px; }
 QHeaderView::section {
-    background: rgba($primario_rgb, 0.06);
-    color: #5a5c69;
+    background: rgba($primario_rgb, 0.08);
+    color: #374151;
     border: 0;
-    padding: 9px;
+    border-bottom: 1px solid rgba($primario_rgb, 0.20);
+    padding: 10px 8px;
+    font-weight: 750;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-size: 11px;
+}
+
+/* ─── Tabs ──────────────────────────────────────────────────────── */
+QTabBar::tab {
+    background: transparent;
+    color: #6b7280;
+    padding: 10px 18px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    font-weight: 650;
+}
+QTabBar::tab:hover { color: $primario; }
+QTabBar::tab:selected {
+    color: $primario;
+    border-bottom: 2px solid $primario;
     font-weight: 750;
 }
+
+/* ─── ScrollBars ────────────────────────────────────────────────── */
+QScrollBar:vertical {
+    border: 0;
+    background: transparent;
+    width: 10px;
+    margin: 4px 2px 4px 2px;
+}
+QScrollBar::handle:vertical {
+    background: rgba($primario_rgb, 0.20);
+    border-radius: 5px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: rgba($primario_rgb, 0.40); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    border: 0;
+    background: transparent;
+    height: 10px;
+    margin: 2px 4px 2px 4px;
+}
+QScrollBar::handle:horizontal {
+    background: rgba($primario_rgb, 0.20);
+    border-radius: 5px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover { background: rgba($primario_rgb, 0.40); }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* ─── Live toggle (cache ↔ VPS en vivo) ─────────────────────────── */
+QCheckBox#liveToggle {
+    spacing: 8px;
+    color: #4b5563;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    font-size: 11px;
+}
+QCheckBox#liveToggle::indicator {
+    width: 36px;
+    height: 18px;
+    border-radius: 9px;
+    background: #e5e7eb;
+    border: 1px solid #d1d5db;
+}
+QCheckBox#liveToggle::indicator:hover {
+    border-color: $primario;
+}
+QCheckBox#liveToggle::indicator:checked {
+    background: $acento_secundario;
+    border: 1px solid $acento_secundario;
+}
+
+/* ─── Diálogos: paleta consistente ──────────────────────────────── */
+QDialog {
+    background: $fondo;
+}
+
+/* ─── Form labels (etiquetas de campos en formularios) ──────────── */
+QLabel#formLabel {
+    color: #4b5563;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+
+/* ─── Page badge (chips en superficies claras: barras de acciones) ─ */
+QLabel#pageBadge {
+    color: $primario_oscuro;
+    background: rgba($primario_rgb, 0.10);
+    border: 1px solid rgba($primario_rgb, 0.25);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+QLabel#pageBadge[state="warning"] {
+    color: #92400e;
+    background: rgba(255, 184, 0, 0.18);
+    border: 1px solid rgba(255, 184, 0, 0.50);
+}
+QLabel#pageBadge[state="success"] {
+    color: #1f6f2e;
+    background: rgba($acento_secundario_rgb, 0.18);
+    border: 1px solid rgba($acento_secundario_rgb, 0.50);
+}
+QLabel#pageBadge[state="danger"] {
+    color: $peligro;
+    background: rgba($peligro_rgb, 0.10);
+    border: 1px solid rgba($peligro_rgb, 0.35);
+}
+
+/* ─── Misc ──────────────────────────────────────────────────────── */
 QFrame#colorSwatch {
     border: 1px solid rgba(0,0,0,0.12);
     border-radius: 6px;
@@ -339,6 +726,11 @@ QFrame#colorSwatch {
     min-height: 26px;
     max-width: 26px;
     max-height: 26px;
+}
+QFrame#divider {
+    background: rgba($primario_rgb, 0.10);
+    max-height: 1px;
+    min-height: 1px;
 }
 """
 
@@ -363,43 +755,63 @@ class LoginView(QWidget):
 
         self.card = QFrame()
         self.card.setObjectName("loginCard")
-        self.card.setFixedWidth(430)
+        self.card.setFixedWidth(440)
         card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(28, 28, 28, 28)
-        card_layout.setSpacing(12)
+        card_layout.setContentsMargins(36, 32, 36, 32)
+        card_layout.setSpacing(10)
 
         self.logo_label = QLabel()
         self.logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.logo_label.setVisible(False)
+
+        eyebrow = QLabel("BIENVENIDO")
+        eyebrow.setObjectName("eyebrow")
+        eyebrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.title = QLabel()
         self.title.setObjectName("loginTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.subtitle = QLabel()
         self.subtitle.setObjectName("muted")
         self.subtitle.setWordWrap(True)
+        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        email_label = QLabel("Correo")
+        email_label.setObjectName("eyebrowMuted")
         self.email = QLineEdit("admin@cybershop.local")
-        self.email.setPlaceholderText("Correo")
+        self.email.setPlaceholderText("tu@correo.com")
+
+        password_label = QLabel("Contraseña")
+        password_label.setObjectName("eyebrowMuted")
         self.password = QLineEdit("admin123")
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText("Contrasena")
-        self.status = QLabel("Usuario inicial: admin@cybershop.local / admin123")
-        self.status.setObjectName("muted")
+        self.password.setPlaceholderText("••••••••")
+
+        self.status = QLabel("Usa tu correo y contraseña del panel web. Local: admin@cybershop.local / admin123")
+        self.status.setObjectName("loginHint")
         self.status.setWordWrap(True)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         button = QPushButton("Entrar")
+        button.setObjectName("primaryAction")
         button.clicked.connect(self._login)
         self.password.returnPressed.connect(self._login)
         self.email.returnPressed.connect(self._login)
 
         card_layout.addWidget(self.logo_label)
+        card_layout.addWidget(eyebrow)
         card_layout.addWidget(self.title)
         card_layout.addWidget(self.subtitle)
-        card_layout.addSpacing(10)
-        card_layout.addWidget(QLabel("Correo"))
+        card_layout.addSpacing(18)
+        card_layout.addWidget(email_label)
         card_layout.addWidget(self.email)
-        card_layout.addWidget(QLabel("Contrasena"))
+        card_layout.addSpacing(4)
+        card_layout.addWidget(password_label)
         card_layout.addWidget(self.password)
+        card_layout.addSpacing(14)
         card_layout.addWidget(button)
+        card_layout.addSpacing(6)
         card_layout.addWidget(self.status)
 
         layout.addWidget(self.card, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -408,8 +820,9 @@ class LoginView(QWidget):
     def apply_branding(self):
         branding = self._brand_callback()
         empresa = branding["empresa"]
-        self.title.setText(f"{empresa['nombre']} Desktop")
-        self.subtitle.setText(empresa.get("slogan") or "")
+        self.title.setText(f"{empresa['nombre']}  POS")
+        slogan = (empresa.get("slogan") or "").strip()
+        self.subtitle.setText(slogan or "Inicia sesión para gestionar ventas, inventario y clientes.")
         logo_path = empresa.get("logo_path") or ""
         if logo_path and Path(logo_path).is_file():
             pix = QPixmap(logo_path)
@@ -422,21 +835,70 @@ class LoginView(QWidget):
         self.logo_label.setVisible(False)
 
     def _login(self):
-        user = self.store.authenticate(self.email.text().strip(), self.password.text())
+        email = self.email.text().strip()
+        password = self.password.text()
+
+        # 1) Intento remoto contra el VPS (si hay sync configurado).
+        try:
+            remote_user = self._try_remote_login(email, password)
+        except RuntimeError as exc:
+            # El VPS rechazó las credenciales o el rol/estado: NO caer a local.
+            self.status.setText(str(exc))
+            self.status.setStyleSheet("color: #b42318;")
+            return
+
+        if remote_user is not None:
+            try:
+                user = self.store.cache_remote_login(remote_user, password)
+            except Exception as exc:  # noqa: BLE001 — surface any persistence error
+                self.status.setText(f"Error guardando sesión local: {exc}")
+                self.status.setStyleSheet("color: #b42318;")
+                return
+            self.status.setStyleSheet("")
+            self.on_login(user)
+            return
+
+        # 2) Fallback local (sync no configurado o sin red).
+        user = self.store.authenticate(email, password)
         if not user:
-            self.status.setText("Credenciales locales invalidas.")
+            self.status.setText("Correo o contraseña incorrectos.")
             self.status.setStyleSheet("color: #b42318;")
             return
         self.status.setStyleSheet("")
-        # S2: forzar cambio antes de operar si la contrasena es la default.
         if user.must_change_password:
             dialog = ChangePasswordDialog(self, store=self.store, user=user, mandatory=True)
             if dialog.exec() != QDialog.DialogCode.Accepted:
-                self.status.setText("Debes cambiar la contrasena para continuar.")
+                self.status.setText("Debes cambiar la contraseña para continuar.")
                 self.status.setStyleSheet("color: #b42318;")
                 return
             user.must_change_password = False
         self.on_login(user)
+
+    def _try_remote_login(self, email: str, password: str):
+        """Intenta validar contra /api/v1/sync/auth.
+
+        Retorna:
+          - dict con datos del usuario si el VPS confirma las credenciales
+          - None si el sync no está configurado o no hay red (caer a local)
+
+        Levanta RuntimeError si el VPS rechazó el login con un mensaje
+        que el caller debe mostrar tal cual (NO debe caer a local).
+        """
+        state = sync_cfg.load(app_data_dir())
+        base_url = state.get("base_url", "")
+        api_key = state.get("api_key", "")
+        if not base_url or not api_key:
+            return None  # Sync no configurado.
+        try:
+            client = SyncClient(base_url, api_key)
+            result = client.remote_login(email, password)
+        except SyncError as exc:
+            if exc.status_code in (401, 403):
+                raise RuntimeError(str(exc) or "Credenciales inválidas.") from exc
+            return None  # Red caída o 5xx: cae a local.
+        except (ValueError, OSError):
+            return None
+        return result.get("user") or {}
 
 
 # =============================================================================
@@ -502,6 +964,312 @@ class ChangePasswordDialog(QDialog):
 
 
 # =============================================================================
+# Widgets compartidos: LiveToggle, OrderStatusDialog, CategoriesDialog
+# =============================================================================
+class LiveToggle(QWidget):
+    """Pill switch que conmuta entre modo cache (default) y VPS en vivo.
+
+    Uso:
+        self.live = LiveToggle()
+        self.live.toggled.connect(self._on_live_changed)
+        # ...
+        def _on_live_changed(self, enabled: bool):
+            if enabled:
+                try:
+                    self._refresh_live()
+                except Exception:
+                    self.live.set_state(False)
+                    self.live.show_error("Sin conexión")
+            else:
+                self.refresh()
+    """
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("liveToggleRoot")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self._chk = QCheckBox("VPS en vivo")
+        self._chk.setObjectName("liveToggle")
+        self._chk.setToolTip(
+            "Cache local (off): los datos vienen de la BD local sincronizada.\n"
+            "VPS en vivo (on): los datos se traen del servidor en cada refresco."
+        )
+        self._chk.toggled.connect(self.toggled.emit)
+        layout.addWidget(self._chk)
+
+    def is_live(self) -> bool:
+        return self._chk.isChecked()
+
+    def set_state(self, enabled: bool):
+        # Bloquear señal para no recursar al revertir
+        self._chk.blockSignals(True)
+        self._chk.setChecked(bool(enabled))
+        self._chk.blockSignals(False)
+
+    def show_error(self, msg: str):
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), msg, self)
+
+
+class OrderStatusDialog(QDialog):
+    """Diálogo para editar estado_pago y estado_envio de un pedido web.
+
+    Al guardar, encola un cambio en outbox vía local_store.enqueue_order_status_update.
+    El sync timer recoge el cambio y lo empuja al VPS.
+    """
+
+    PAGO_OPTIONS = ["PENDIENTE", "APROBADO", "RECHAZADO", "REEMBOLSADO"]
+    ENVIO_OPTIONS = ["POR_DESPACHAR", "DESPACHADO", "ENTREGADO", "CANCELADO"]
+
+    def __init__(self, parent, store: LocalStore, order: dict, on_saved=None):
+        super().__init__(parent)
+        self.store = store
+        self.order = order
+        self.on_saved = on_saved or (lambda: None)
+        self.setWindowTitle(f"Editar pedido #{order.get('remote_id', '?')}")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("PEDIDO WEB")
+        eyebrow.setObjectName("eyebrow")
+        layout.addWidget(eyebrow)
+
+        title = QLabel(f"#{order.get('reference', order.get('remote_id', '?'))}")
+        title.setObjectName("loginTitle")
+        layout.addWidget(title)
+
+        info_lines = [
+            f"Cliente: {order.get('customer_name') or '-'}",
+            f"Total: $ {order.get('total', 0):,.0f}".replace(",", "."),
+            f"Método: {order.get('payment_method') or '-'}",
+        ]
+        info = QLabel("\n".join(info_lines))
+        info.setObjectName("muted")
+        layout.addWidget(info)
+        layout.addSpacing(8)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.pago_combo = QComboBox()
+        self.pago_combo.addItems(self.PAGO_OPTIONS)
+        current_pago = (order.get("status_payment") or "").upper()
+        idx = self.pago_combo.findText(current_pago)
+        if idx >= 0:
+            self.pago_combo.setCurrentIndex(idx)
+
+        self.envio_combo = QComboBox()
+        self.envio_combo.addItems(self.ENVIO_OPTIONS)
+        current_envio = (order.get("status_shipping") or "").upper()
+        idx = self.envio_combo.findText(current_envio)
+        if idx >= 0:
+            self.envio_combo.setCurrentIndex(idx)
+
+        form.addRow("Estado del pago:", self.pago_combo)
+        form.addRow("Estado del envío:", self.envio_combo)
+        layout.addLayout(form)
+
+        self.feedback = QLabel("")
+        self.feedback.setObjectName("muted")
+        layout.addWidget(self.feedback)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save(self):
+        new_pago = self.pago_combo.currentText().strip()
+        new_envio = self.envio_combo.currentText().strip()
+        old_pago = (self.order.get("status_payment") or "").upper()
+        old_envio = (self.order.get("status_shipping") or "").upper()
+
+        if new_pago == old_pago and new_envio == old_envio:
+            self.feedback.setText("Sin cambios.")
+            self.feedback.setStyleSheet("color: #6b7280;")
+            return
+
+        try:
+            self.store.enqueue_order_status_update(
+                remote_id=int(self.order.get("remote_id")),
+                estado_pago=new_pago if new_pago != old_pago else None,
+                estado_envio=new_envio if new_envio != old_envio else None,
+                updated_at_iso=self.order.get("updated_at"),
+            )
+        except (ValueError, sqlite_error_class()) as exc:
+            self.feedback.setText(f"Error: {exc}")
+            self.feedback.setStyleSheet("color: #b42318; font-weight: 700;")
+            return
+
+        self.on_saved()
+        self.accept()
+
+
+def sqlite_error_class():
+    """Proxy: devuelve sqlite3.Error para usar en except (evita import en cabecera del archivo)."""
+    import sqlite3
+    return sqlite3.Error
+
+
+class CategoriesDialog(QDialog):
+    """Modal CRUD de categorías. Operaciones encolan outbox para PUSH al VPS."""
+
+    def __init__(self, parent, store: LocalStore, on_changed=None):
+        super().__init__(parent)
+        self.store = store
+        self.on_changed = on_changed or (lambda: None)
+        self.setWindowTitle("Categorías")
+        self.setMinimumSize(560, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("BIDIRECCIONAL CON VPS")
+        eyebrow.setObjectName("eyebrow")
+        layout.addWidget(eyebrow)
+
+        title = QLabel("Gestionar categorías")
+        title.setObjectName("loginTitle")
+        layout.addWidget(title)
+
+        sub = QLabel(
+            "Crea, renombra o elimina categorías. Los cambios se sincronizan "
+            "con el VPS automáticamente cuando hay conexión."
+        )
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        actions_row = QHBoxLayout()
+        new_btn = QPushButton("+  Nueva")
+        new_btn.setObjectName("primaryAction")
+        new_btn.clicked.connect(self._new)
+        rename_btn = QPushButton("Renombrar")
+        rename_btn.setObjectName("secondaryAction")
+        rename_btn.clicked.connect(self._rename)
+        delete_btn = QPushButton("Eliminar")
+        delete_btn.setObjectName("dangerAction")
+        delete_btn.clicked.connect(self._delete)
+        actions_row.addWidget(new_btn)
+        actions_row.addWidget(rename_btn)
+        actions_row.addWidget(delete_btn)
+        actions_row.addStretch(1)
+        layout.addLayout(actions_row)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Categoría", "# productos", "Estado sync"])
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, self.table.horizontalHeader().ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, self.table.horizontalHeader().ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, self.table.horizontalHeader().ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+
+        self.feedback = QLabel("")
+        self.feedback.setObjectName("muted")
+        layout.addWidget(self.feedback)
+
+        close_btn = QPushButton("Cerrar")
+        close_btn.setObjectName("secondaryAction")
+        close_btn.clicked.connect(self.accept)
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(close_btn)
+        layout.addLayout(bottom_row)
+
+        self._refresh()
+
+    def _refresh(self):
+        cats = self.store.list_generos_with_product_count()
+        self.table.setRowCount(len(cats))
+        self._categories = cats
+        for row_idx, cat in enumerate(cats):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(cat["nombre"]))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(str(cat["productos_count"])))
+            sync_state = "Sincronizado" if cat.get("remote_id") else "Pendiente push"
+            self.table.setItem(row_idx, 2, QTableWidgetItem(sync_state))
+
+    def _selected_category(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._categories):
+            return None
+        return self._categories[row]
+
+    def _new(self):
+        name, ok = QInputDialog.getText(self, "Nueva categoría", "Nombre:")
+        if not ok or not name.strip():
+            return
+        try:
+            self.store.enqueue_category_create(name.strip())
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        self._info(f'Categoría "{name.strip()}" creada. Push al VPS pendiente.')
+        self._refresh()
+        self.on_changed()
+
+    def _rename(self):
+        cat = self._selected_category()
+        if not cat:
+            self._error("Selecciona una categoría.")
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Renombrar categoría", "Nuevo nombre:", text=cat["nombre"]
+        )
+        if not ok or not new_name.strip() or new_name.strip() == cat["nombre"]:
+            return
+        try:
+            self.store.enqueue_category_update(int(cat["id"]), new_name.strip())
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        self._info(f'Renombrada a "{new_name.strip()}". Push al VPS pendiente.')
+        self._refresh()
+        self.on_changed()
+
+    def _delete(self):
+        cat = self._selected_category()
+        if not cat:
+            self._error("Selecciona una categoría.")
+            return
+        confirm = QMessageBox.question(
+            self, "Confirmar",
+            f'Eliminar la categoría "{cat["nombre"]}"?',
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.enqueue_category_delete(int(cat["id"]))
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        self._info(f'Eliminada. Push al VPS pendiente.')
+        self._refresh()
+        self.on_changed()
+
+    def _error(self, msg: str):
+        self.feedback.setText(msg)
+        self.feedback.setStyleSheet("color: #b42318; font-weight: 700;")
+
+    def _info(self, msg: str):
+        self.feedback.setText(msg)
+        self.feedback.setStyleSheet("color: #117a36; font-weight: 600;")
+
+
+# =============================================================================
 # Dashboard
 # =============================================================================
 class DashboardPage(QWidget):
@@ -513,56 +1281,160 @@ class DashboardPage(QWidget):
 
     def _build(self):
         body = QVBoxLayout(self)
-        body.setContentsMargins(28, 24, 28, 24)
-        body.setSpacing(16)
+        body.setContentsMargins(24, 22, 24, 22)
+        body.setSpacing(14)
 
-        header = QLabel("Menu administrativo")
+        header = QLabel("Menú administrativo")
         header.setObjectName("pageTitle")
-        subtitle = QLabel("Centro de operaciones local con modulos independientes y una sola base de datos.")
+        subtitle = QLabel("Centro de operaciones local con módulos independientes y una sola base de datos.")
         subtitle.setObjectName("muted")
         body.addWidget(header)
         body.addWidget(subtitle)
+        body.addSpacing(2)
         body.addWidget(self._hero_panel())
 
+        local_eyebrow = QLabel("TU NEGOCIO  ·  LOCAL")
+        local_eyebrow.setObjectName("eyebrow")
+        body.addWidget(local_eyebrow)
         self.metrics_grid = QGridLayout()
-        self.metrics_grid.setSpacing(12)
+        self.metrics_grid.setSpacing(10)
         body.addLayout(self.metrics_grid)
+
+        body.addWidget(self._vps_metrics_panel())
         body.addWidget(self._module_grid())
         body.addStretch(1)
         self.refresh()
+        # Pull stats VPS asíncrono en arranque
+        QTimer.singleShot(800, self._pull_vps_stats)
+
+    def _vps_metrics_panel(self):
+        panel = QFrame()
+        panel.setObjectName("sectionPanel")
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(16, 12, 16, 14)
+        outer.setSpacing(8)
+
+        header = QHBoxLayout()
+        eyebrow = QLabel("MÉTRICAS DEL VPS  ·  TIEMPO REAL")
+        eyebrow.setObjectName("eyebrow")
+        header.addWidget(eyebrow)
+        header.addStretch(1)
+        self.vps_status = QLabel("—")
+        self.vps_status.setObjectName("muted")
+        header.addWidget(self.vps_status)
+        refresh_btn = QPushButton("↻  Refrescar")
+        refresh_btn.setObjectName("secondaryAction")
+        refresh_btn.setMinimumWidth(120)
+        refresh_btn.clicked.connect(self._pull_vps_stats)
+        header.addWidget(refresh_btn)
+        outer.addLayout(header)
+
+        self.vps_grid = QGridLayout()
+        self.vps_grid.setSpacing(10)
+        outer.addLayout(self.vps_grid)
+
+        # Inicializa con cards en estado vacío
+        self._vps_cards_data = [
+            ("ventas_web_hoy",     "Ventas web · hoy"),
+            ("ventas_web_semana",  "Ventas web · 7 días"),
+            ("pedidos_pendientes", "Pedidos pendientes"),
+            ("productos_total",    "Productos en VPS"),
+        ]
+        self._vps_cards = {}
+        for idx, (key, label) in enumerate(self._vps_cards_data):
+            card = metric_card(label, "Sin datos", empty=True)
+            self._vps_cards[key] = card
+            self.vps_grid.addWidget(card, idx // 4, idx % 4)
+        return panel
+
+    def _pull_vps_stats(self):
+        """Llama /api/v1/sync/stats y actualiza las cards."""
+        sync_state = sync_cfg.load(app_data_dir())
+        base_url = sync_state.get("base_url", "")
+        api_key = sync_state.get("api_key", "")
+        if not base_url or not api_key:
+            self._set_vps_cards_offline("Sync no configurada")
+            return
+        try:
+            client = SyncClient(base_url, api_key)
+            stats = client.pull_stats()
+        except (ValueError, SyncError):
+            self._set_vps_cards_offline("Sin conexión")
+            return
+
+        # Actualizar cards
+        formatters = {
+            "ventas_web_hoy":     lambda v: f"${v.get('total', 0):,.0f}".replace(",", ".") + f" · {v.get('count', 0)}",
+            "ventas_web_semana":  lambda v: f"${v.get('total', 0):,.0f}".replace(",", ".") + f" · {v.get('count', 0)}",
+            "pedidos_pendientes": lambda v: str(v),
+            "productos_total":    lambda v: str(v),
+        }
+        for key, _label in self._vps_cards_data:
+            value = stats.get(key, 0)
+            if value is None:
+                self._update_card_value(self._vps_cards[key], "Sin datos", empty=True)
+            else:
+                self._update_card_value(self._vps_cards[key], formatters[key](value), empty=False)
+
+        from datetime import datetime
+        self.vps_status.setText(
+            f"Actualizado · {datetime.now().strftime('%H:%M:%S')}"
+        )
+
+    def _set_vps_cards_offline(self, reason: str):
+        for key, _label in self._vps_cards_data:
+            self._update_card_value(self._vps_cards[key], "Sin datos", empty=True)
+        self.vps_status.setText(reason)
+
+    def _update_card_value(self, card_frame, new_text: str, empty: bool = False):
+        """Actualiza el QLabel#metricValue del card y marca su estado."""
+        for child in card_frame.findChildren(QLabel):
+            if child.objectName() == "metricValue":
+                child.setText(new_text)
+                child.setProperty("state", "empty" if empty else "")
+                child.style().unpolish(child)
+                child.style().polish(child)
+                return
 
     def _hero_panel(self):
         hero = QFrame()
         hero.setObjectName("dashboardHero")
         layout = QHBoxLayout(hero)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(18)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(16)
 
         copy = QVBoxLayout()
+        copy.setSpacing(4)
         eyebrow = QLabel("Flujo diario recomendado")
         eyebrow.setObjectName("eyebrow")
-        title = QLabel("Empieza por POS e inventario, luego revisa sincronizacion.")
+        title = QLabel("Empieza por POS e inventario, luego revisa la sincronización.")
         title.setObjectName("heroTitle")
+        title.setWordWrap(True)
         detail = QLabel(
-            "Este tablero mantiene las operaciones principales disponibles aunque no exista conexion a internet."
-            " Atajos: F1 Dashboard - F2 Productos - F3 POS - F4 Inventario - F5 Ventas - F6 Usuarios - F7 Sync."
+            "El tablero mantiene las operaciones principales disponibles aunque no exista conexión a internet. "
+            "Atajos: F1 Dashboard · F2 Productos · F3 POS · F4 Inventario · F5 Ventas · F6 Usuarios · F7 Sync · F8 Configuración."
         )
         detail.setObjectName("muted")
         detail.setWordWrap(True)
         copy.addWidget(eyebrow)
         copy.addWidget(title)
+        copy.addSpacing(2)
         copy.addWidget(detail)
+        copy.addStretch(1)
 
         highlights = QVBoxLayout()
+        highlights.setSpacing(8)
+        highlights.setContentsMargins(0, 0, 0, 0)
         for label, value in [
-            ("Operacion diaria", "POS e inventario"),
-            ("Catalogo", "Productos y precios"),
-            ("Conexion", "Cambios pendientes"),
+            ("Operación diaria", "POS e inventario"),
+            ("Catálogo", "Productos y precios"),
+            ("Conexión", "Cambios pendientes"),
         ]:
             item = QFrame()
             item.setObjectName("heroHighlight")
             item_layout = QVBoxLayout(item)
-            item_layout.setContentsMargins(14, 10, 14, 10)
+            item_layout.setContentsMargins(12, 8, 12, 8)
+            item_layout.setSpacing(2)
             small = QLabel(label)
             small.setObjectName("eyebrowMuted")
             strong = QLabel(value)
@@ -571,8 +1443,8 @@ class DashboardPage(QWidget):
             item_layout.addWidget(strong)
             highlights.addWidget(item)
 
-        layout.addLayout(copy, stretch=2)
-        layout.addLayout(highlights, stretch=1)
+        layout.addLayout(copy, stretch=3)
+        layout.addLayout(highlights, stretch=2)
         return hero
 
     def refresh(self):
@@ -585,29 +1457,74 @@ class DashboardPage(QWidget):
             ("Pendiente sync", str(metrics["pending_sync"])),
         ]
         for index, (label, value) in enumerate(cards):
-            self.metrics_grid.addWidget(metric_card(label, value), index // 2, index % 2)
+            self.metrics_grid.addWidget(metric_card(label, value), 0, index)
 
     def _module_grid(self):
         frame = QFrame()
         frame.setObjectName("sectionPanel")
-        layout = QGridLayout(frame)
-        layout.setContentsMargins(16, 16, 16, 16)
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(16, 12, 16, 14)
+        outer.setSpacing(8)
+
+        eyebrow_row = QHBoxLayout()
+        eyebrow = QLabel("ATAJOS A MÓDULOS")
+        eyebrow.setObjectName("eyebrow")
+        eyebrow_row.addWidget(eyebrow)
+        eyebrow_row.addStretch(1)
+        outer.addLayout(eyebrow_row)
+
+        layout = QGridLayout()
         layout.setSpacing(10)
+        outer.addLayout(layout)
 
         modules = [
-            ("Productos", "CRUD local y precios", "products"),
-            ("POS", "Venta directa offline", "pos"),
-            ("Inventario", "Entradas y salidas", "inventory"),
-            ("Ventas", "Historial y recibos", "sales"),
-            ("Usuarios", "CRUD local", "users"),
-            ("Sync", "Estado de la BD local", "sync"),
+            ("▦", "Productos",   "CRUD local y precios",  "F2", "products"),
+            ("◰", "POS",         "Venta directa offline", "F3", "pos"),
+            ("⊞", "Inventario",  "Entradas y salidas",    "F4", "inventory"),
+            ("$", "Ventas",      "Historial y recibos",   "F5", "sales"),
+            ("◉", "Usuarios",    "CRUD local",            "F6", "users"),
+            ("⟳", "Sync",        "Estado de la BD local", "F7", "sync"),
         ]
-        for index, (title, detail, target) in enumerate(modules):
-            button = QPushButton(f"{title}\n{detail}")
-            button.setObjectName("moduleButton")
-            button.clicked.connect(lambda checked=False, name=target: self.open_section(name))
-            layout.addWidget(button, index // 3, index % 3)
+        for index, (icon, title, detail, shortcut, target) in enumerate(modules):
+            card = self._module_card(icon, title, detail, shortcut, target)
+            layout.addWidget(card, index // 3, index % 3)
         return frame
+
+    def _module_card(self, icon, title, detail, shortcut, target):
+        card = QFrame()
+        card.setObjectName("moduleCard")
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setToolTip(f"{title} · {shortcut}")
+
+        row = QHBoxLayout(card)
+        row.setContentsMargins(12, 10, 12, 10)
+        row.setSpacing(12)
+
+        icon_label = QLabel(icon)
+        icon_label.setObjectName("moduleCardIcon")
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(icon_label)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+        title_label = QLabel(title)
+        title_label.setObjectName("moduleCardTitle")
+        detail_label = QLabel(detail)
+        detail_label.setObjectName("moduleCardDetail")
+        text_col.addWidget(title_label)
+        text_col.addWidget(detail_label)
+        row.addLayout(text_col, 1)
+
+        shortcut_label = QLabel(shortcut)
+        shortcut_label.setObjectName("moduleCardShortcut")
+        shortcut_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(shortcut_label)
+
+        def _on_click(event, name=target):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.open_section(name)
+        card.mousePressEvent = _on_click
+        return card
 
 
 # =============================================================================
@@ -627,9 +1544,23 @@ class ProductsPage(QWidget):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(14)
 
+        # Header: título + acción "Gestionar categorías" + LiveToggle
+        header_row = QHBoxLayout()
         title = QLabel("Productos")
         title.setObjectName("pageTitle")
-        layout.addWidget(title)
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+
+        self.cats_btn = QPushButton("⚙  Gestionar categorías")
+        self.cats_btn.setObjectName("secondaryAction")
+        self.cats_btn.setToolTip("Crear, renombrar o eliminar categorías (sincroniza al VPS)")
+        self.cats_btn.clicked.connect(self._open_categories_dialog)
+        header_row.addWidget(self.cats_btn)
+
+        self.live = LiveToggle()
+        self.live.toggled.connect(self._on_live_toggled)
+        header_row.addWidget(self.live)
+        layout.addLayout(header_row)
 
         form = QFrame()
         form.setObjectName("sectionPanel")
@@ -690,18 +1621,23 @@ class ProductsPage(QWidget):
         form_layout.addLayout(image_row, next_row + 1, 0, 1, 3)
 
         actions = QHBoxLayout()
-        save = QPushButton("Guardar producto")
-        save.clicked.connect(self._save)
-        new = QPushButton("Nuevo")
-        new.setObjectName("secondaryAction")
-        new.clicked.connect(self._clear_form)
-        delete = QPushButton("Desactivar")
-        delete.setObjectName("dangerAction")
-        delete.clicked.connect(self._delete)
-        actions.addWidget(save)
-        actions.addWidget(new)
-        actions.addWidget(delete)
+        self.save_btn = QPushButton("Guardar producto")
+        self.save_btn.clicked.connect(self._save)
+        self.new_btn = QPushButton("Nuevo")
+        self.new_btn.setObjectName("secondaryAction")
+        self.new_btn.clicked.connect(self._clear_form)
+        self.delete_btn = QPushButton("Desactivar")
+        self.delete_btn.setObjectName("dangerAction")
+        self.delete_btn.clicked.connect(self._delete)
+        actions.addWidget(self.save_btn)
+        actions.addWidget(self.new_btn)
+        actions.addWidget(self.delete_btn)
         actions.addStretch(1)
+        self.live_badge = QLabel("●  VPS EN VIVO · SOLO LECTURA")
+        self.live_badge.setObjectName("pageBadge")
+        self.live_badge.setProperty("state", "warning")
+        self.live_badge.setVisible(False)
+        actions.addWidget(self.live_badge)
 
         layout.addWidget(form)
         layout.addLayout(actions)
@@ -859,6 +1795,92 @@ class ProductsPage(QWidget):
         self.image_path.clear()
         self.genero_combo.setCurrentIndex(0)
 
+    # ── Categorías (modal CRUD bidi con VPS) ──
+    def _open_categories_dialog(self):
+        dlg = CategoriesDialog(self, self.store, on_changed=self._on_categories_changed)
+        dlg.exec()
+
+    def _on_categories_changed(self):
+        # Refrescar el combo de géneros al cerrar el diálogo
+        try:
+            current_data = self.genero_combo.currentData()
+            self.genero_combo.clear()
+            self.genero_combo.addItem("(sin genero)", None)
+            for g in self.store.list_generos():
+                self.genero_combo.addItem(g["nombre"], g.get("remote_id") or g["id"])
+            # Restaurar selección si existe
+            for i in range(self.genero_combo.count()):
+                if self.genero_combo.itemData(i) == current_data:
+                    self.genero_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        self.on_changed()
+
+    # ── Live toggle: VPS en vivo vs cache local ──
+    def _on_live_toggled(self, live: bool):
+        self._set_crud_enabled(not live)
+        if live:
+            self._refresh_live_from_vps()
+        else:
+            self.refresh()
+
+    def _set_crud_enabled(self, enabled: bool):
+        for w in (self.save_btn, self.new_btn, self.delete_btn,
+                  self.sku, self.barcode, self.name, self.category,
+                  self.stock, self.min_stock, self.price, self.image_path,
+                  self.genero_combo, self.cats_btn):
+            try:
+                w.setEnabled(enabled)
+            except Exception:
+                pass
+        self.live_badge.setVisible(not enabled)
+
+    def _refresh_live_from_vps(self):
+        """Trae productos del VPS en tiempo real y los muestra (read-only)."""
+        sync_state = sync_cfg.load(app_data_dir())
+        base_url = sync_state.get("base_url", "")
+        api_key = sync_state.get("api_key", "")
+        if not base_url or not api_key:
+            self.live.set_state(False)
+            self._set_crud_enabled(True)
+            self.live.show_error("Sincronización no configurada")
+            return
+        try:
+            client = SyncClient(base_url, api_key)
+            resp = client.pull_products_live(limit=2000)
+        except (ValueError, SyncError):
+            self.live.set_state(False)
+            self._set_crud_enabled(True)
+            self.live.show_error("Sin conexión — volviendo a cache")
+            return
+        items = resp.get("items", [])
+        # Renderizar en la tabla con el formato que espera la UI existente
+        self._render_live_products(items)
+
+    def _render_live_products(self, items):
+        """Renderiza productos del VPS directamente en la tabla, sin tocar SQLite."""
+        if not hasattr(self, "table"):
+            return
+        self.table.setRowCount(len(items))
+        # Columnas: ID, SKU, Barcode, Nombre, Categoria, Stock, Minimo, Precio
+        for row_idx, p in enumerate(items):
+            cells = [
+                str(p.get("remote_id", "")),
+                p.get("sku", "") or "",
+                p.get("barcode", "") or "",
+                p.get("name", "") or "",
+                p.get("category", "") or "",
+                str(p.get("stock", 0)),
+                "—",  # minimo no viene en /sync/products
+                f"$ {float(p.get('price', 0)):,.0f}".replace(",", "."),
+            ]
+            for col_idx, val in enumerate(cells):
+                self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(val)))
+        # Invalidar la lista local que usan otros métodos para evitar editar
+        # algo que ya no representa el cache.
+        self._all_products = []
+        self.selected_id = None
 
 # =============================================================================
 # Inventario
@@ -1361,24 +2383,39 @@ class SalesPage(QWidget):
         local_layout.addWidget(local_hint)
         self.tabs.addTab(local_widget, "Ventas POS desktop")
 
-        # Tab 2: ventas web (cache de pedidos PayU)
+        # Tab 2: ventas web (cache de pedidos PayU) — editable bidi
         remote_widget = QWidget()
         remote_layout = QVBoxLayout(remote_widget)
         remote_layout.setContentsMargins(0, 8, 0, 0)
+
+        # Header row con LiveToggle
+        remote_header = QHBoxLayout()
+        remote_title = QLabel("Pedidos del ecommerce web")
+        remote_title.setObjectName("highlightText")
+        remote_header.addWidget(remote_title)
+        remote_header.addStretch(1)
+        self.remote_live = LiveToggle()
+        self.remote_live.toggled.connect(self._on_remote_live_toggled)
+        remote_header.addWidget(self.remote_live)
+        remote_layout.addLayout(remote_header)
+
         self.remote_table = QTableWidget()
-        self.remote_table.setColumnCount(7)
+        self.remote_table.setColumnCount(8)
         self.remote_table.setHorizontalHeaderLabels(
-            ["ID", "Referencia", "Cliente", "Pago", "Envio", "Total", "Fecha"]
+            ["ID", "Referencia", "Cliente", "Pago", "Envio", "Total", "Fecha", "Acciones"]
         )
         self.remote_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.remote_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self.remote_table.setAlternatingRowColors(True)
         remote_layout.addWidget(self.remote_table)
         remote_hint = QLabel(
-            "Pedidos del ecommerce web. Se actualiza con la sincronizacion automatica (F7)."
+            "Edita el estado de pago/envío con el botón en cada fila. "
+            "Los cambios se sincronizan al VPS automáticamente."
         )
         remote_hint.setObjectName("muted")
+        remote_hint.setWordWrap(True)
         remote_layout.addWidget(remote_hint)
-        self.tabs.addTab(remote_widget, "Pedidos web (read-only)")
+        self.tabs.addTab(remote_widget, "Pedidos web")
 
         layout.addWidget(self.tabs)
         self.refresh()
@@ -1412,6 +2449,9 @@ class SalesPage(QWidget):
 
         # Pedidos web (cache)
         remote = self.store.list_remote_sales(limit=200)
+        self._render_remote_orders(remote)
+
+    def _render_remote_orders(self, remote):
         self.remote_table.setRowCount(len(remote))
         for row_index, r in enumerate(remote):
             values = [
@@ -1425,6 +2465,56 @@ class SalesPage(QWidget):
             ]
             for col_index, value in enumerate(values):
                 self.remote_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+            # Botón "Editar estado" en columna 7 (deshabilitado en live mode)
+            edit_btn = QPushButton("Editar estado")
+            edit_btn.setObjectName("inlineDanger" if False else "secondaryAction")
+            edit_btn.setEnabled(not (hasattr(self, "remote_live") and self.remote_live.is_live()))
+            edit_btn.clicked.connect(lambda checked=False, order=r: self._open_order_dialog(order))
+            self.remote_table.setCellWidget(row_index, 7, edit_btn)
+
+    def _open_order_dialog(self, order: dict):
+        dlg = OrderStatusDialog(self, self.store, order, on_saved=self._on_order_saved)
+        dlg.exec()
+
+    def _on_order_saved(self):
+        # Refrescar tabla con cache local (que ya fue actualizado optimistamente)
+        self.refresh()
+        # Disparar sync inmediato si hay otros pendientes — el SyncPage tiene el timer,
+        # aquí solo notificamos al shell que algo cambió.
+
+    def _on_remote_live_toggled(self, live: bool):
+        if not live:
+            self.refresh()
+            return
+        sync_state = sync_cfg.load(app_data_dir())
+        base_url = sync_state.get("base_url", "")
+        api_key = sync_state.get("api_key", "")
+        if not base_url or not api_key:
+            self.remote_live.set_state(False)
+            self.remote_live.show_error("Sincronización no configurada")
+            return
+        try:
+            client = SyncClient(base_url, api_key)
+            resp = client.pull_orders_live(limit=500)
+        except (ValueError, SyncError):
+            self.remote_live.set_state(False)
+            self.remote_live.show_error("Sin conexión")
+            return
+        # El response tiene shape {items: [...]} — adaptamos al formato de cache
+        items = resp.get("items", [])
+        adapted = [
+            {
+                "remote_id":       item.get("remote_id"),
+                "reference":       item.get("reference"),
+                "customer_name":   item.get("customer_name"),
+                "status_payment":  item.get("status_payment"),
+                "status_shipping": item.get("status_shipping"),
+                "total":           item.get("total"),
+                "updated_at":      item.get("updated_at"),
+            }
+            for item in items
+        ]
+        self._render_remote_orders(adapted)
 
     def _open_detail(self, item):
         row = item.row()
@@ -1455,9 +2545,16 @@ class UsersPage(QWidget):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(14)
 
+        # Header con título + LiveToggle
+        header_row = QHBoxLayout()
         title = QLabel("Usuarios locales")
         title.setObjectName("pageTitle")
-        layout.addWidget(title)
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        self.live = LiveToggle()
+        self.live.toggled.connect(self._on_live_toggled)
+        header_row.addWidget(self.live)
+        layout.addLayout(header_row)
 
         info = QLabel(
             "Solo se usan dentro de esta instalacion. Para sincronizacion con la web se necesita el modulo de sync."
@@ -1467,18 +2564,23 @@ class UsersPage(QWidget):
         layout.addWidget(info)
 
         actions = QHBoxLayout()
-        new_btn = QPushButton("Nuevo usuario")
-        new_btn.clicked.connect(self._create)
-        edit_btn = QPushButton("Editar seleccionado")
-        edit_btn.setObjectName("secondaryAction")
-        edit_btn.clicked.connect(self._edit_selected)
-        deactivate_btn = QPushButton("Desactivar seleccionado")
-        deactivate_btn.setObjectName("dangerAction")
-        deactivate_btn.clicked.connect(self._deactivate_selected)
-        actions.addWidget(new_btn)
-        actions.addWidget(edit_btn)
-        actions.addWidget(deactivate_btn)
+        self.new_btn = QPushButton("Nuevo usuario")
+        self.new_btn.clicked.connect(self._create)
+        self.edit_btn = QPushButton("Editar seleccionado")
+        self.edit_btn.setObjectName("secondaryAction")
+        self.edit_btn.clicked.connect(self._edit_selected)
+        self.deactivate_btn = QPushButton("Desactivar seleccionado")
+        self.deactivate_btn.setObjectName("dangerAction")
+        self.deactivate_btn.clicked.connect(self._deactivate_selected)
+        actions.addWidget(self.new_btn)
+        actions.addWidget(self.edit_btn)
+        actions.addWidget(self.deactivate_btn)
         actions.addStretch(1)
+        self.live_badge = QLabel("●  VPS EN VIVO · SOLO LECTURA")
+        self.live_badge.setObjectName("pageBadge")
+        self.live_badge.setProperty("state", "warning")
+        self.live_badge.setVisible(False)
+        actions.addWidget(self.live_badge)
         layout.addLayout(actions)
 
         self.table = QTableWidget()
@@ -1488,6 +2590,50 @@ class UsersPage(QWidget):
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table)
         self.refresh()
+
+    # ── Live toggle: cache local ↔ VPS en vivo ──
+    def _on_live_toggled(self, live: bool):
+        self._set_crud_enabled(not live)
+        if live:
+            self._refresh_live_from_vps()
+        else:
+            self.refresh()
+
+    def _set_crud_enabled(self, enabled: bool):
+        self.new_btn.setEnabled(enabled)
+        self.edit_btn.setEnabled(enabled)
+        self.deactivate_btn.setEnabled(enabled)
+        self.live_badge.setVisible(not enabled)
+
+    def _refresh_live_from_vps(self):
+        sync_state = sync_cfg.load(app_data_dir())
+        base_url = sync_state.get("base_url", "")
+        api_key = sync_state.get("api_key", "")
+        if not base_url or not api_key:
+            self.live.set_state(False)
+            self._set_crud_enabled(True)
+            self.live.show_error("Sincronización no configurada")
+            return
+        try:
+            client = SyncClient(base_url, api_key)
+            resp = client.pull_users_live(limit=1000)
+        except (ValueError, SyncError):
+            self.live.set_state(False)
+            self._set_crud_enabled(True)
+            self.live.show_error("Sin conexión")
+            return
+        items = resp.get("items", [])
+        self.table.setRowCount(len(items))
+        for row_idx, u in enumerate(items):
+            values = [
+                str(u.get("remote_id", "")),
+                u.get("email", ""),
+                u.get("nombre", ""),
+                u.get("rol_nombre", ""),
+                "Si" if (u.get("estado") or "").lower() != "deshabilitado" else "No",
+            ]
+            for col_idx, val in enumerate(values):
+                self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(val)))
 
     def refresh(self):
         users = self.store.users()
@@ -1805,6 +2951,26 @@ class SyncPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table)
+
+        # ─── Panel de diagnóstico bidi: matriz por entidad ───
+        diag_eyebrow = QLabel("DIAGNÓSTICO BIDIRECCIONAL")
+        diag_eyebrow.setObjectName("eyebrow")
+        layout.addWidget(diag_eyebrow)
+
+        self.bidi_table = QTableWidget()
+        self.bidi_table.setColumnCount(5)
+        self.bidi_table.setHorizontalHeaderLabels(
+            ["Entidad", "PULL ←VPS", "PUSH →VPS", "Cursor", "Último intento"]
+        )
+        self.bidi_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.bidi_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.bidi_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.bidi_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.bidi_table.setAlternatingRowColors(True)
+        self.bidi_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.bidi_table.setMaximumHeight(260)
+        layout.addWidget(self.bidi_table)
+
         self.refresh()
 
     def refresh(self):
@@ -1831,6 +2997,44 @@ class SyncPage(QWidget):
             ]
             for col_index, value in enumerate(values):
                 self.table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+
+        self._refresh_bidi_matrix()
+
+    def _refresh_bidi_matrix(self):
+        """Pinta la matriz de bidireccionalidad por entidad. Lee los cursores
+        y last_sync_status de sync_config.json para mostrar contexto real."""
+        state = sync_cfg.load(self._base_dir)
+        rows = [
+            # (entidad, PULL, PUSH, cursor_field)
+            ("Productos",        "✓", "✓", "cursor_products"),
+            ("Categorías",       "✓", "✓", "cursor_generos"),
+            ("Usuarios",         "✓", "✓", "cursor_users"),
+            ("Ventas POS",       "—", "✓", None),
+            ("Movim. inventario", "—", "✓", None),
+            ("Pedidos web",      "✓", "✓", "cursor_sales_web"),
+            ("Auditoría stock",  "✓", "—", "cursor_inventory_log"),
+            ("Branding",         "✓", "—", None),
+        ]
+        last_at = state.get("last_sync_at") or "—"
+        last_status = state.get("last_sync_status") or "sin intentos"
+        last_str = f"{last_at}  ({last_status})"
+
+        self.bidi_table.setRowCount(len(rows))
+        for row_idx, (entidad, pull, push, cursor_field) in enumerate(rows):
+            self.bidi_table.setItem(row_idx, 0, QTableWidgetItem(entidad))
+
+            pull_item = QTableWidgetItem(pull)
+            pull_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.bidi_table.setItem(row_idx, 1, pull_item)
+
+            push_item = QTableWidgetItem(push)
+            push_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.bidi_table.setItem(row_idx, 2, push_item)
+
+            cursor_val = state.get(cursor_field, "") if cursor_field else "—"
+            self.bidi_table.setItem(row_idx, 3, QTableWidgetItem(cursor_val or "—"))
+
+            self.bidi_table.setItem(row_idx, 4, QTableWidgetItem(last_str))
 
     def _mark_synced(self):
         confirm = QMessageBox.question(
@@ -2404,15 +3608,16 @@ class ConfiguracionPage(QWidget):
 # Shell
 # =============================================================================
 class DesktopShell(QMainWindow):
+    # (key, icono unicode, etiqueta, atajo, sección)
     NAV_ITEMS = [
-        ("dashboard", "Dashboard", "F1"),
-        ("products", "Productos", "F2"),
-        ("pos", "POS", "F3"),
-        ("inventory", "Inventario", "F4"),
-        ("sales", "Ventas", "F5"),
-        ("users", "Usuarios", "F6"),
-        ("sync", "Sincronizacion", "F7"),
-        ("config", "Configuracion", "F8"),
+        ("dashboard", "▦", "Dashboard",       "F1", "Operación"),
+        ("pos",       "⌧", "POS",             "F3", "Operación"),
+        ("sales",     "$", "Ventas",          "F5", "Operación"),
+        ("products",  "▤", "Productos",       "F2", "Datos"),
+        ("inventory", "⊞", "Inventario",      "F4", "Datos"),
+        ("users",     "◯", "Usuarios",        "F6", "Datos"),
+        ("sync",      "⟳", "Sincronización",  "F7", "Sistema"),
+        ("config",    "✎", "Configuración",   "F8", "Sistema"),
     ]
 
     def __init__(self):
@@ -2420,7 +3625,14 @@ class DesktopShell(QMainWindow):
         self.store = LocalStore()
         self.user = None
         self._app_dir = app_data_dir()
+        self._install_conf = install_conf.load(self._app_dir)
+        self._bootstrap_sync_from_install_conf()
         self.branding = branding_mod.load_branding(self._app_dir)
+        self._update_skip_version = sync_cfg.load(self._app_dir).get("skip_version", "")
+        logo_path = (self.branding.get("empresa") or {}).get("logo_path") or ""
+        self.setWindowIcon(
+            QIcon(logo_path) if logo_path and Path(logo_path).is_file() else _default_app_icon()
+        )
         self.resize(1260, 820)
         self.setMinimumSize(1000, 660)
 
@@ -2455,46 +3667,72 @@ class DesktopShell(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(248)
+        sidebar.setFixedWidth(252)
         side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(18, 18, 18, 18)
-        side_layout.setSpacing(8)
+        side_layout.setContentsMargins(16, 20, 16, 16)
+        side_layout.setSpacing(4)
 
+        # Header del sidebar: logo + marca + subtítulo
         self.sidebar_logo = QLabel()
-        self.sidebar_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_logo.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.sidebar_logo.setVisible(False)
         side_layout.addWidget(self.sidebar_logo)
 
         self.brand_label = QLabel("CyberShop")
         self.brand_label.setObjectName("brand")
-        mode = QLabel("Modo local offline")
-        mode.setObjectName("offlineBadge")
         side_layout.addWidget(self.brand_label)
-        side_layout.addWidget(mode)
 
+        self.brand_subtitle = QLabel("Punto de venta")
+        self.brand_subtitle.setObjectName("brandSubtitle")
+        side_layout.addWidget(self.brand_subtitle)
+
+        # Badge de estado de sync (online/syncing/offline)
+        self.sync_badge = QLabel("●  Modo local")
+        self.sync_badge.setObjectName("syncBadge")
+        self.sync_badge.setProperty("state", "offline")
+        side_layout.addWidget(self.sync_badge)
+
+        side_layout.addSpacing(12)
+
+        # User card
         self.user_card = QFrame()
         self.user_card.setObjectName("userCard")
-        user_layout = QVBoxLayout(self.user_card)
-        user_layout.setContentsMargins(12, 10, 12, 10)
-        self.user_name_label = QLabel("-")
+        user_outer = QHBoxLayout(self.user_card)
+        user_outer.setContentsMargins(12, 10, 12, 10)
+        user_outer.setSpacing(10)
+        self.user_avatar_label = QLabel("·")
+        self.user_avatar_label.setObjectName("userAvatar")
+        self.user_avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        user_outer.addWidget(self.user_avatar_label)
+        user_text = QVBoxLayout()
+        user_text.setSpacing(0)
+        self.user_name_label = QLabel("Sin sesión")
         self.user_name_label.setObjectName("userName")
-        self.user_role_label = QLabel("-")
+        self.user_role_label = QLabel("—")
         self.user_role_label.setObjectName("userRole")
-        user_layout.addWidget(self.user_name_label)
-        user_layout.addWidget(self.user_role_label)
+        user_text.addWidget(self.user_name_label)
+        user_text.addWidget(self.user_role_label)
+        user_outer.addLayout(user_text, 1)
         side_layout.addWidget(self.user_card)
-        side_layout.addSpacing(10)
 
+        # Nav items agrupados por sección
         self.nav_buttons = {}
-        for key, label, shortcut in self.NAV_ITEMS:
-            button = QPushButton(f"{label}    {shortcut}")
+        last_section = None
+        for key, icon, label, shortcut, section in self.NAV_ITEMS:
+            if section != last_section:
+                section_label = QLabel(section)
+                section_label.setObjectName("sidebarSection")
+                side_layout.addWidget(section_label)
+                last_section = section
+            button = QPushButton(f"  {icon}    {label}")
             button.setObjectName("navButton")
+            button.setToolTip(f"{label} ({shortcut})")
             button.clicked.connect(lambda checked=False, name=key: self._show_section(name))
             self.nav_buttons[key] = button
             side_layout.addWidget(button)
 
         side_layout.addStretch(1)
-        logout = QPushButton("Cerrar sesion")
+        logout = QPushButton("  ↪    Cerrar sesión")
         logout.setObjectName("logoutButton")
         logout.clicked.connect(self._logout)
         side_layout.addWidget(logout)
@@ -2534,30 +3772,42 @@ class DesktopShell(QMainWindow):
         return root
 
     def _setup_shortcuts(self):
-        for key, _label, shortcut in self.NAV_ITEMS:
+        for key, _icon, _label, shortcut, _section in self.NAV_ITEMS:
             sc = QShortcut(QKeySequence(shortcut), self)
             sc.activated.connect(lambda name=key: self._show_section(name))
 
     def _login_success(self, user):
         self.user = user
-        self.user_name_label.setText(user.name)
-        self.user_role_label.setText(f"{user.role} - {user.email}")
+        name = (user.name or "").strip() or "Usuario"
+        self.user_name_label.setText(name)
+        role = (user.role or "—").strip()
+        email = (user.email or "").strip()
+        self.user_role_label.setText(f"{role} · {email}" if email else role)
+        initial = name[:1].upper() if name else "·"
+        self.user_avatar_label.setText(initial)
         info = self.store.db_info()
         self.footer_right.setText(info["path"])
         self.stack.setCurrentWidget(self.app_view)
         self._show_section("dashboard")
+        # Kickoff diferido (no bloqueante a la UI): branding sync + update check.
+        # Se ejecuta una sola vez por sesión. Si falla por red, silencioso.
+        QTimer.singleShot(500, self._pull_branding_from_server)
+        QTimer.singleShot(1500, self._check_for_updates)
 
     def _logout(self):
         confirm = QMessageBox.question(
             self,
-            "Cerrar sesion",
-            "Esta seguro? Las ventas en curso del POS se descartaran.",
+            "Cerrar sesión",
+            "¿Está seguro? Las ventas en curso del POS se descartarán.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
         if isinstance(self.pages.get("pos"), PosPage):
             self.pages["pos"]._clear_cart()
         self.user = None
+        self.user_name_label.setText("Sin sesión")
+        self.user_role_label.setText("—")
+        self.user_avatar_label.setText("·")
         self.scanner.set_enabled(False)
         self.stack.setCurrentWidget(self.login_view)
 
@@ -2594,12 +3844,15 @@ class DesktopShell(QMainWindow):
         self.setWindowTitle(empresa.get("ventana_titulo") or f"{empresa['nombre']} Desktop")
         if hasattr(self, "brand_label"):
             self.brand_label.setText(empresa["nombre"])
+        if hasattr(self, "brand_subtitle"):
+            slogan = (empresa.get("slogan") or "").strip()
+            self.brand_subtitle.setText(slogan or "Punto de venta")
         if hasattr(self, "sidebar_logo"):
             logo_path = empresa.get("logo_path") or ""
             if logo_path and Path(logo_path).is_file():
                 pix = QPixmap(logo_path)
                 if not pix.isNull():
-                    pix = pix.scaledToHeight(56, Qt.TransformationMode.SmoothTransformation)
+                    pix = pix.scaledToHeight(48, Qt.TransformationMode.SmoothTransformation)
                     self.sidebar_logo.setPixmap(pix)
                     self.sidebar_logo.setVisible(True)
                 else:
@@ -2611,19 +3864,161 @@ class DesktopShell(QMainWindow):
             self.login_view.apply_branding()
         self.setStyleSheet(branding_mod.render_qss(self.branding, QSS_TEMPLATE))
 
+    def set_sync_state(self, state: str, label: str | None = None):
+        """Actualiza el badge de sync. state ∈ {'online','syncing','offline'}."""
+        if not hasattr(self, "sync_badge"):
+            return
+        defaults = {
+            "online":  "●  Conectado",
+            "syncing": "●  Sincronizando…",
+            "offline": "●  Modo local",
+        }
+        self.sync_badge.setText(label or defaults.get(state, "●  Modo local"))
+        self.sync_badge.setProperty("state", state if state in defaults else "offline")
+        # Forzar re-aplicación del QSS dependiente del property
+        self.sync_badge.style().unpolish(self.sync_badge)
+        self.sync_badge.style().polish(self.sync_badge)
+
+    # ── Bootstrap desde .cybershop.conf (escrito por el wizard del instalador) ──
+    def _bootstrap_sync_from_install_conf(self):
+        """Si el wizard escribió .cybershop.conf y sync_config.json está vacío,
+        copia URL y API key al sync_config para no obligar al usuario a meter
+        los datos de nuevo en F7."""
+        if not install_conf.is_configured(self._install_conf):
+            return  # no hay .cybershop.conf con datos válidos
+        current = sync_cfg.load(self._app_dir)
+        if current.get("base_url") and current.get("api_key"):
+            return  # ya configurado, no pisar
+        sync_cfg.update(
+            self._app_dir,
+            base_url=self._install_conf.get("SERVER_URL", ""),
+            api_key=self._install_conf.get("SYNC_API_KEY", ""),
+            enabled=True,
+            interval_sec=install_conf.sync_interval_sec(self._install_conf),
+        )
+
+    # ── Pull de branding desde el servidor (no bloqueante) ──
+    def _pull_branding_from_server(self):
+        """Llama /api/v1/sync/branding y aplica el resultado a branding.json.
+
+        Best-effort: si no hay red o la API key es inválida, no hace nada.
+        Respeta sync_config.branding_local_override.
+        """
+        state = sync_cfg.load(self._app_dir)
+        if state.get("branding_local_override"):
+            return
+        if not state.get("base_url") or not state.get("api_key"):
+            self.set_sync_state("offline")
+            return
+        self.set_sync_state("syncing")
+        try:
+            client = SyncClient(state["base_url"], state["api_key"])
+            remote = client.pull_branding()
+        except (ValueError, SyncError):
+            self.set_sync_state("offline")
+            return  # sin red o key inválida → silencioso
+        try:
+            self.branding = branding_mod.apply_remote_branding(
+                self._app_dir, remote,
+                download_logo=lambda url, dest: SyncClient(state["base_url"], state["api_key"]).download_file(url, dest),
+            )
+            self.apply_branding()
+            sync_cfg.update(self._app_dir, last_branding_pull_at=_now_iso_local())
+            self.set_sync_state("online")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[branding-sync] error aplicando branding remoto: {exc}")
+            self.set_sync_state("offline")
+
+    # ── Auto-update: check de versión disponible ──
+    def _check_for_updates(self):
+        """Llama /api/v1/sync/version. Si hay versión nueva, muestra diálogo.
+
+        Best-effort: si no hay red, ignora.
+        """
+        if not install_conf.auto_update_enabled(self._install_conf):
+            return
+        state = sync_cfg.load(self._app_dir)
+        base_url = state.get("base_url") or self._install_conf.get("SERVER_URL", "")
+        api_key = state.get("api_key") or self._install_conf.get("SYNC_API_KEY", "")
+        if not base_url:
+            return
+        try:
+            client = SyncClient(base_url, api_key or "x")  # api_key opcional para /version
+            manifest = client.pull_version()
+        except (ValueError, SyncError):
+            return
+        latest = (manifest.get("latest") or "").strip()
+        if not latest or _version_cmp(latest, APP_VERSION) <= 0:
+            return  # ya estamos al día
+        if latest == self._update_skip_version:
+            return  # el usuario eligió saltar esta versión
+        self._show_update_dialog(manifest)
+
+    def _show_update_dialog(self, manifest):
+        latest = manifest.get("latest", "?")
+        notes = (manifest.get("release_notes") or "").strip()
+        download_url = manifest.get("download_url") or ""
+        text = (
+            f"Hay una versión nueva del POS Desktop disponible.\n\n"
+            f"Versión actual: {APP_VERSION}\n"
+            f"Versión nueva:  {latest}\n\n"
+            f"{notes if notes else 'Notas de versión no disponibles.'}\n\n"
+            f"¿Descargar e instalar ahora?"
+        )
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Actualización disponible")
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Icon.Information)
+        btn_download = msg.addButton("Descargar e instalar", QMessageBox.ButtonRole.AcceptRole)
+        btn_later = msg.addButton("Más tarde", QMessageBox.ButtonRole.RejectRole)
+        btn_skip = msg.addButton("Saltar esta versión", QMessageBox.ButtonRole.DestructiveRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked is btn_skip:
+            sync_cfg.update(self._app_dir, skip_version=latest)
+            self._update_skip_version = latest
+        elif clicked is btn_download and download_url:
+            self._download_and_launch_installer(download_url)
+        # btn_later → no hacer nada, vuelve a aparecer al próximo arranque
+
+    def _download_and_launch_installer(self, url):
+        """Descarga el instalador a temp y lo ejecuta. Cierra esta app para
+        permitir reemplazo de archivos."""
+        import os
+        import subprocess
+        import tempfile
+        state = sync_cfg.load(self._app_dir)
+        client = SyncClient(state.get("base_url") or self._install_conf.get("SERVER_URL", ""),
+                            state.get("api_key") or "x")
+        dest = Path(tempfile.gettempdir()) / "CyberShopSetup_update.exe"
+        try:
+            client.download_file(url, dest)
+        except SyncError as exc:
+            QMessageBox.warning(self, "Descarga fallida", f"No se pudo descargar la actualización:\n{exc}")
+            return
+        try:
+            subprocess.Popen([str(dest)], close_fds=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Error", f"No se pudo iniciar el instalador:\n{exc}")
+            return
+        QApplication.quit()
+
 
 # =============================================================================
 # Helpers
 # =============================================================================
-def metric_card(label, value):
+def metric_card(label, value, empty: bool = False):
     frame = QFrame()
     frame.setObjectName("metricCard")
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setContentsMargins(14, 12, 14, 12)
+    layout.setSpacing(2)
     value_label = QLabel(value)
     value_label.setObjectName("metricValue")
+    if empty:
+        value_label.setProperty("state", "empty")
     label_widget = QLabel(label)
-    label_widget.setObjectName("muted")
+    label_widget.setObjectName("metricLabel")
     layout.addWidget(value_label)
     layout.addWidget(label_widget)
     return frame
@@ -2660,7 +4055,14 @@ def clear_layout(layout):
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CyberShop.Desktop")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(_default_app_icon())
     quit_action = QAction("Salir")
     quit_action.triggered.connect(app.quit)
     window = DesktopShell()

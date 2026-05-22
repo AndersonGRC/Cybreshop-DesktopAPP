@@ -111,6 +111,53 @@ def reset_branding(base_dir: Path) -> dict[str, Any]:
     return deepcopy(DEFAULTS)
 
 
+def apply_remote_branding(base_dir: Path, remote: dict[str, Any], download_logo=None) -> dict[str, Any]:
+    """Aplica el branding traído del servidor (/api/v1/sync/branding).
+
+    Args:
+      base_dir: directorio de datos (%APPDATA%/CyberShopNative o fallback)
+      remote: dict con shape {empresa: {...}, colores: {...}, logo_url: ...}
+      download_logo: callable(url, dest_path) opcional para bajar el logo.
+                     Si None, el logo no se descarga (pero el dict lo refleja).
+
+    Política:
+      - Solo sobrescribe claves que vienen con valor no vacío en el remote.
+      - Las claves vacías del remote se IGNORAN (preservan el valor local).
+      - Si descarga logo exitosamente, actualiza empresa.logo_path al path local.
+
+    Returns: el branding final guardado.
+    """
+    current = load_branding(base_dir)
+
+    # Empresa: merge no destructivo
+    remote_empresa = remote.get("empresa") or {}
+    if isinstance(remote_empresa, dict):
+        for k, v in remote_empresa.items():
+            if k in current["empresa"] and isinstance(v, str) and v.strip():
+                current["empresa"][k] = v.strip()
+
+    # Colores: merge respetando solo claves válidas y formato hex
+    remote_colores = remote.get("colores") or {}
+    if isinstance(remote_colores, dict):
+        for k, v in remote_colores.items():
+            if k in current["colores"] and isinstance(v, str) and _is_hex_color(v):
+                current["colores"][k] = v
+
+    # Logo: descargar si nos dieron función de descarga + URL
+    logo_url = remote.get("logo_url") or ""
+    if logo_url and download_logo:
+        local_logo = Path(base_dir) / "logo_remote.png"
+        try:
+            download_logo(logo_url, local_logo)
+            if local_logo.exists() and local_logo.stat().st_size > 0:
+                current["empresa"]["logo_path"] = str(local_logo)
+        except Exception:
+            pass  # logo es opcional, no romper si falla
+
+    save_branding(base_dir, current)
+    return current
+
+
 def render_qss(branding: dict[str, Any], template: str) -> str:
     """Sustituye placeholders $primario, $acento, etc. en una plantilla QSS.
 

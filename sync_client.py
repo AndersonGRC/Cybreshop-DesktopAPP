@@ -85,6 +85,81 @@ class SyncClient:
     def push_outbox(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/sync/outbox", body={"items": items})
 
+    def pull_branding(self) -> dict[str, Any]:
+        """Branding (empresa + colores + logo_url) del tenant.
+
+        Estructura:
+          {empresa: {nombre, slogan?, email?, telefono?, ...},
+           colores: {primario, primario_oscuro, acento, ...},
+           logo_url: 'https://server/static/img/Logo.png',
+           updated_at: '...'}
+        """
+        return self._request("GET", "/api/v1/sync/branding")
+
+    def pull_config(self) -> dict[str, Any]:
+        """Info pública del tenant: slug, nombre, plan, estado."""
+        return self._request("GET", "/api/v1/sync/config")
+
+    def pull_version(self) -> dict[str, Any]:
+        """Manifiesto de versión disponible. NO requiere api_key, pero la mandamos igual."""
+        return self._request("GET", "/api/v1/sync/version")
+
+    def pull_stats(self) -> dict[str, Any]:
+        """Métricas agregadas del tenant (ventas web, pedidos pendientes, etc.)."""
+        return self._request("GET", "/api/v1/sync/stats")
+
+    def remote_login(self, email: str, password: str) -> dict[str, Any]:
+        """Valida credenciales contra la tabla `usuarios` del tenant en el VPS.
+
+        Returns: {"user": {"remote_id", "email", "nombre", "rol_id",
+                            "rol_nombre", "estado"}}
+        Raises:  SyncError. status_code 401 → credenciales inválidas;
+                 403 → cuenta inhabilitada o rol bloqueado.
+        """
+        return self._request("POST", "/api/v1/sync/auth",
+                             body={"email": email, "password": password})
+
+    # ── Helpers de fetch en vivo (sin cursor, sin tocar SQLite local) ──
+    def pull_products_live(self, limit: int = 5000) -> dict[str, Any]:
+        return self.pull_products(since=None, limit=limit, include_inactive=False)
+
+    def pull_users_live(self, limit: int = 1000) -> dict[str, Any]:
+        return self.pull_users(since=None, limit=limit)
+
+    def pull_categories_live(self, limit: int = 500) -> dict[str, Any]:
+        return self.pull_generos(since=None, limit=limit)
+
+    def pull_orders_live(self, limit: int = 500) -> dict[str, Any]:
+        return self.pull_sales_web(since=None, limit=limit)
+
+    def download_file(self, url: str, dest_path) -> int:
+        """Descarga un archivo binario (logo, instalador) a dest_path. Retorna bytes escritos.
+
+        url puede ser absoluta (https://...) o relativa (/static/...).
+        No envía X-Sync-Key porque estos endpoints son públicos.
+        """
+        if url.startswith('/'):
+            url = f"{self.base_url}{url}"
+        elif not url.startswith(('http://', 'https://')):
+            raise SyncError(f"URL inválida: {url}")
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 60)) as resp:
+                from pathlib import Path
+                p = Path(dest_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                total = 0
+                with open(p, 'wb') as fh:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        total += len(chunk)
+                return total
+        except urllib.error.URLError as e:
+            raise SyncError(f"Error descargando {url}: {e.reason}") from e
+
     # ── Internals ─────────────────────────────────────────────
     def _request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"

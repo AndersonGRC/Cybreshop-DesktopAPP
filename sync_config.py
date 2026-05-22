@@ -34,6 +34,10 @@ DEFAULTS: dict[str, Any] = {
     "last_sync_status": "",
     "last_sync_at": "",
     "last_stale_count": "0",
+    # Auto-update / branding sync
+    "skip_version": "",                  # versión saltada por el usuario
+    "branding_local_override": False,    # True = no pisar branding local con remoto
+    "last_branding_pull_at": "",
 }
 
 CONFIG_FILE = "sync_config.json"
@@ -58,7 +62,7 @@ def load(base_dir: Path) -> dict[str, Any]:
     for key, default in DEFAULTS.items():
         value = raw.get(key, default)
         # Cast suave
-        if key == "enabled":
+        if key in ("enabled", "branding_local_override"):
             value = bool(value)
         elif key == "interval_sec":
             try:

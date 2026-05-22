@@ -102,6 +102,69 @@ class LocalStore:
             must_change_password=bool(row["must_change_password"]),
         )
 
+    def cache_remote_login(self, remote_user: dict, password: str) -> "User":
+        """Persiste el resultado de un login remoto exitoso.
+
+        Crea o actualiza el registro local en `users` usando los datos del
+        VPS (email, nombre, rol, remote_id) y guarda el hash PBKDF2 del
+        password recién verificado por el servidor. Esto permite que el
+        siguiente login del mismo usuario funcione offline contra el cache.
+        """
+        email = (remote_user.get("email") or "").strip().lower()
+        if not email:
+            raise ValueError("Respuesta remota sin email.")
+        nombre = (remote_user.get("nombre") or remote_user.get("name") or email).strip()
+        rol_remote = (remote_user.get("rol_nombre") or "Cajero").strip()
+        rl = rol_remote.lower()
+        if rl in ("admin", "administrador", "super_admin", "propietario"):
+            role = "Administrador"
+        elif rl in ("cajero", "vendedor", "empleado", "mesero"):
+            role = "Cajero"
+        elif rl in ("contador",):
+            role = "Inventario"
+        else:
+            role = "Cajero"
+        remote_id = remote_user.get("remote_id")
+        estado = (remote_user.get("estado") or "habilitado").strip().lower()
+        active = 0 if estado in ("deshabilitado", "eliminado") else 1
+        pwd_hash = hash_password(password)
+
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE LOWER(email) = LOWER(?)",
+                (email,),
+            ).fetchone()
+            if existing:
+                user_id = int(existing["id"])
+                conn.execute(
+                    """
+                    UPDATE users
+                       SET name = ?, role = ?, active = ?, remote_id = ?,
+                           password_hash = ?, must_change_password = 0,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?
+                    """,
+                    (nombre, role, active, remote_id, pwd_hash, user_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO users (email, name, role, password_hash, active,
+                                       must_change_password, remote_id)
+                    VALUES (?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (email, nombre, role, pwd_hash, active, remote_id),
+                )
+                user_id = int(cur.lastrowid)
+
+        return User(
+            id=user_id,
+            email=email,
+            name=nombre,
+            role=role,
+            must_change_password=False,
+        )
+
     def change_password(self, user_id: int, new_password: str) -> None:
         if not new_password or len(new_password) < 6:
             raise ValueError("La nueva contrasena debe tener al menos 6 caracteres.")
@@ -601,11 +664,11 @@ class LocalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement", "product", "user")):
+    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement", "product", "user", "category", "order")):
         """Devuelve items pendientes de enviar al servidor (max `limit`).
 
-        Filtra por entidades soportadas por el server (sale, inventory_movement).
-        Otras entidades quedan encoladas pero no se intentan empujar.
+        Filtra por entidades soportadas por el server. Otras entidades quedan
+        encoladas pero no se intentan empujar.
         """
         placeholders = ",".join("?" * len(entities))
         with self.connect() as conn:
@@ -728,6 +791,132 @@ class LocalStore:
                 "SELECT id, remote_id, nombre FROM generos ORDER BY nombre"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_generos_with_product_count(self):
+        """Como list_generos pero con count(productos) por categoría.
+
+        Local: products.category es TEXT (no FK), así que cuenta por nombre.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT g.id, g.remote_id, g.nombre,
+                       (SELECT COUNT(*) FROM products p WHERE LOWER(p.category) = LOWER(g.nombre)) AS productos_count
+                FROM generos g
+                ORDER BY g.nombre
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── Outbox: categorías (PUSH al VPS vía /sync/outbox entity='category') ───
+
+    def enqueue_category_create(self, nombre: str) -> int:
+        """Inserta categoría local y encola create. Devuelve el local_id."""
+        nombre = (nombre or "").strip()
+        if not nombre:
+            raise ValueError("nombre obligatorio")
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM generos WHERE LOWER(nombre) = LOWER(?)", (nombre,)
+            ).fetchone()
+            if existing:
+                raise ValueError("Ya existe una categoría con ese nombre")
+            cur = conn.execute(
+                "INSERT INTO generos (nombre) VALUES (?)", (nombre,)
+            )
+            local_id = int(cur.lastrowid)
+            self._queue_outbox(conn, "category", str(local_id), "create",
+                               {"nombre": nombre, "local_id": local_id})
+            return local_id
+
+    def enqueue_category_update(self, local_id: int, nombre: str):
+        """Renombra categoría local y encola update con remote_id."""
+        nombre = (nombre or "").strip()
+        if not nombre:
+            raise ValueError("nombre obligatorio")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT remote_id, nombre FROM generos WHERE id = ?", (int(local_id),)
+            ).fetchone()
+            if not row:
+                raise ValueError("categoría no existe")
+            collision = conn.execute(
+                "SELECT id FROM generos WHERE LOWER(nombre) = LOWER(?) AND id != ?",
+                (nombre, int(local_id)),
+            ).fetchone()
+            if collision:
+                raise ValueError("Ya existe otra categoría con ese nombre")
+            conn.execute(
+                "UPDATE generos SET nombre = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (nombre, int(local_id)),
+            )
+            payload = {"nombre": nombre, "local_id": int(local_id)}
+            if row["remote_id"]:
+                payload["remote_id"] = int(row["remote_id"])
+            self._queue_outbox(conn, "category", str(local_id), "update", payload)
+
+    def enqueue_category_delete(self, local_id: int):
+        """Elimina categoría local (si no tiene productos) y encola delete.
+
+        Lanza ValueError si tiene productos asociados (consistente con el
+        comportamiento del servidor). Match por nombre (products.category es TEXT).
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT remote_id, nombre FROM generos WHERE id = ?", (int(local_id),)
+            ).fetchone()
+            if not row:
+                raise ValueError("categoría no existe")
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE LOWER(category) = LOWER(?)",
+                (row["nombre"],),
+            ).fetchone()[0]
+            if cnt:
+                raise ValueError(f"Tiene {cnt} producto(s) asociados; reasígnalos primero")
+            conn.execute("DELETE FROM generos WHERE id = ?", (int(local_id),))
+            payload = {"local_id": int(local_id)}
+            if row["remote_id"]:
+                payload["remote_id"] = int(row["remote_id"])
+            self._queue_outbox(conn, "category", str(local_id), "delete", payload)
+
+    # ─── Outbox: pedidos web (PUSH al VPS vía /sync/outbox entity='order') ───
+
+    def enqueue_order_status_update(self, remote_id: int, estado_pago: str | None,
+                                     estado_envio: str | None,
+                                     updated_at_iso: str | None = None) -> int:
+        """Encola un cambio de estado de pedido web. También actualiza
+        remote_sales_cache de forma optimista para reflejar el cambio en UI.
+
+        Retorna el id de la fila insertada en outbox.
+        """
+        if not remote_id:
+            raise ValueError("remote_id obligatorio")
+        payload = {"remote_id": int(remote_id)}
+        if estado_pago is not None and estado_pago != "":
+            payload["estado_pago"] = str(estado_pago)
+        if estado_envio is not None and estado_envio != "":
+            payload["estado_envio"] = str(estado_envio)
+        if not (set(payload.keys()) - {"remote_id"}):
+            raise ValueError("nada que actualizar")
+        if updated_at_iso:
+            payload["updated_at"] = updated_at_iso
+
+        with self.connect() as conn:
+            self._queue_outbox(conn, "order", str(int(remote_id)), "update", payload)
+            outbox_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            # UI optimista: refleja el cambio en cache local
+            sets, params = [], []
+            if "estado_pago" in payload:
+                sets.append("status_payment = ?"); params.append(payload["estado_pago"])
+            if "estado_envio" in payload:
+                sets.append("status_shipping = ?"); params.append(payload["estado_envio"])
+            if sets:
+                params.append(int(remote_id))
+                conn.execute(
+                    f"UPDATE remote_sales_cache SET {', '.join(sets)} WHERE remote_id = ?",
+                    tuple(params),
+                )
+            return outbox_id
 
     def upsert_user_from_remote(self, remote):
         """Sincroniza perfil de usuario (sin password).
