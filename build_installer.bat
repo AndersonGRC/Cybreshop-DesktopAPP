@@ -16,20 +16,29 @@ cd /d "%~dp0"
 
 echo.
 echo [1/3] Empaquetando con PyInstaller...
-call build_exe.bat
+call ".\build_exe.bat"
 if errorlevel 1 (
   echo ERROR: build_exe.bat fallo.
   exit /b %errorlevel%
 )
 
-set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-if not exist "%ISCC%" (
+REM Busca ISCC.exe en las rutas conocidas (default + drive D + drive E)
+set "ISCC="
+for %%P in (
+  "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+  "C:\Program Files\Inno Setup 6\ISCC.exe"
+  "D:\Inno Setup 6\ISCC.exe"
+  "E:\Inno Setup 6\ISCC.exe"
+) do if exist %%P set "ISCC=%%~P"
+
+if not defined ISCC (
   echo.
-  echo ERROR: No se encontro Inno Setup 6 en:
-  echo   %ISCC%
+  echo ERROR: No se encontro Inno Setup 6 en ninguna ruta conocida.
   echo Descarga e instala desde https://jrsoftware.org/isdl.php
+  echo O edita este .bat y agrega la ruta de tu ISCC.exe al loop de busqueda.
   exit /b 1
 )
+echo Usando ISCC: %ISCC%
 
 echo.
 echo [2/3] Compilando instalador con Inno Setup...

@@ -108,6 +108,16 @@ class SyncClient:
         """Métricas agregadas del tenant (ventas web, pedidos pendientes, etc.)."""
         return self._request("GET", "/api/v1/sync/stats")
 
+    def pull_restaurant_snapshot(self) -> dict[str, Any]:
+        """Estado completo del módulo de mesas: tables, open_orders,
+        consumptions y products. Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/restaurant/snapshot")
+
+    def pull_contabilidad_snapshot(self) -> dict[str, Any]:
+        """Estado del módulo de contabilidad: movimientos, plantillas,
+        cierres y categorias. Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/contabilidad/snapshot")
+
     def remote_login(self, email: str, password: str) -> dict[str, Any]:
         """Valida credenciales contra la tabla `usuarios` del tenant en el VPS.
 

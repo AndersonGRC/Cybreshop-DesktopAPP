@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['desktop_native\\main.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[('assets/cybershop.ico', 'assets'), ('assets/cybershop.png', 'assets')],

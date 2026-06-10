@@ -9,7 +9,7 @@ if not exist "venv\Scripts\python.exe" (
 )
 
 venv\Scripts\python.exe -m pip install pyinstaller >nul
-venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --name CyberShopOffline main.py
+venv\Scripts\python.exe -m PyInstaller --noconfirm --clean CyberShopOffline.spec
 if errorlevel 1 exit /b %errorlevel%
 
 echo.

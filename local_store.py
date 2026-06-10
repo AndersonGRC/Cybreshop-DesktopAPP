@@ -3,7 +3,9 @@ import json
 import os
 import secrets
 import sqlite3
+import uuid as _uuid
 from contextlib import contextmanager
+from datetime import date, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,38 @@ LEGACY_PBKDF2_ITERATIONS = 120_000  # Hashes antiguos: re-hashear al login.
 
 DEFAULT_ADMIN_EMAIL = "admin@cybershop.local"
 DEFAULT_ADMIN_PASSWORD = "admin123"
+
+# Roles de producción (tabla `roles`, espejo de security.py del backend):
+#   1 admin · 2 usuario/propietario · 3 cliente · 4 empleado · 5 contador
+#   6 Mesero · 7 Cajero.  Se prioriza rol_id (autoritativo) y se cae al nombre.
+_ROLE_BY_ID = {
+    1: "Administrador", 2: "Administrador", 3: "Cliente",
+    4: "Empleado", 5: "Contador", 6: "Mesero", 7: "Cajero",
+}
+
+
+def map_role(rol_id, rol_nombre=None) -> str:
+    """Traduce el rol de producción a un rol canónico del desktop."""
+    try:
+        rid = int(rol_id) if rol_id is not None else None
+    except (TypeError, ValueError):
+        rid = None
+    if rid in _ROLE_BY_ID:
+        return _ROLE_BY_ID[rid]
+    name = (rol_nombre or "").strip().lower()
+    if name in ("admin", "administrador", "super_admin", "propietario", "usuario", "owner", "dueño"):
+        return "Administrador"
+    if name == "mesero":
+        return "Mesero"
+    if name == "cajero":
+        return "Cajero"
+    if name in ("empleado", "vendedor"):
+        return "Empleado"
+    if name == "contador":
+        return "Contador"
+    if name == "cliente":
+        return "Cliente"
+    return "Cajero"
 
 
 @dataclass
@@ -114,16 +148,7 @@ class LocalStore:
         if not email:
             raise ValueError("Respuesta remota sin email.")
         nombre = (remote_user.get("nombre") or remote_user.get("name") or email).strip()
-        rol_remote = (remote_user.get("rol_nombre") or "Cajero").strip()
-        rl = rol_remote.lower()
-        if rl in ("admin", "administrador", "super_admin", "propietario"):
-            role = "Administrador"
-        elif rl in ("cajero", "vendedor", "empleado", "mesero"):
-            role = "Cajero"
-        elif rl in ("contador",):
-            role = "Inventario"
-        else:
-            role = "Cajero"
+        role = map_role(remote_user.get("rol_id"), remote_user.get("rol_nombre"))
         remote_id = remote_user.get("remote_id")
         estado = (remote_user.get("estado") or "habilitado").strip().lower()
         active = 0 if estado in ("deshabilitado", "eliminado") else 1
@@ -204,6 +229,14 @@ class LocalStore:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_products(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+
+    def count_generos(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM generos").fetchone()[0])
 
     def product_options(self):
         with self.connect() as conn:
@@ -664,7 +697,7 @@ class LocalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement", "product", "user", "category", "order")):
+    def pending_outbox(self, limit: int = 50, entities: tuple[str, ...] = ("sale", "inventory_movement", "product", "user", "category", "order", "restaurant_op", "contabilidad_op")):
         """Devuelve items pendientes de enviar al servidor (max `limit`).
 
         Filtra por entidades soportadas por el server. Otras entidades quedan
@@ -918,6 +951,652 @@ class LocalStore:
                 )
             return outbox_id
 
+    # ════════════════════════════════════════════════════════════════
+    # Modulo Restaurante (espejo local + outbox)
+    # ════════════════════════════════════════════════════════════════
+    # Modelo de consistencia offline-first:
+    #   - synced=1  -> fila confiada al servidor (la sobreescribe el pull).
+    #   - synced=0  -> cambio local pendiente; el pull la preserva.
+    #   - replace_restaurant_snapshot() borra las filas synced=1 y reconstruye
+    #     desde el servidor; conserva las synced=0 (creadas/cambiadas offline).
+    #   - mark_restaurant_pushed() (tras push exitoso) pone synced=1, para que
+    #     el siguiente pull adopte la verdad del servidor sin duplicar.
+
+    RT_TABLE_STATES = ("disponible", "ocupada", "reservada", "cuenta_solicitada")
+    RT_CONSUMPTION_STATES = ("pendiente", "preparando", "servido")
+    RT_PAYMENT_METHODS = ("EFECTIVO", "TARJETA", "TRANSFERENCIA", "MIXTO")
+
+    def replace_restaurant_snapshot(self, data: dict):
+        """Reconstruye el espejo local desde el snapshot del servidor.
+
+        Conserva las filas con cambios locales pendientes (synced=0).
+        """
+        tables = data.get("tables") or []
+        open_orders = data.get("open_orders") or []
+        consumptions = data.get("consumptions") or []
+        with self.connect() as conn:
+            # ── Mesas ──────────────────────────────────────────────
+            server_ids = set()
+            for t in tables:
+                tid = int(t["id"])
+                server_ids.add(tid)
+                row = conn.execute("SELECT synced FROM rt_tables WHERE remote_id = ?", (tid,)).fetchone()
+                if row and row["synced"] == 0:
+                    # preserva estado local pendiente; actualiza solo el layout
+                    conn.execute(
+                        """UPDATE rt_tables SET codigo=?, nombre=?, area=?, capacidad=?, forma=?,
+                               pos_x=?, pos_y=?, ancho=?, alto=?, rotacion=?, updated_at=?
+                           WHERE remote_id=?""",
+                        (t.get("codigo"), t.get("nombre"), t.get("area") or "Salon principal",
+                         int(t.get("capacidad") or 0), t.get("forma") or "square",
+                         float(t.get("pos_x") or 0), float(t.get("pos_y") or 0),
+                         float(t.get("ancho") or 16), float(t.get("alto") or 16),
+                         int(t.get("rotacion") or 0), t.get("updated_at"), tid),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO rt_tables
+                               (remote_id, codigo, nombre, area, capacidad, forma, estado,
+                                pos_x, pos_y, ancho, alto, rotacion, synced, updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)
+                           ON CONFLICT(remote_id) DO UPDATE SET
+                               codigo=excluded.codigo, nombre=excluded.nombre, area=excluded.area,
+                               capacidad=excluded.capacidad, forma=excluded.forma, estado=excluded.estado,
+                               pos_x=excluded.pos_x, pos_y=excluded.pos_y, ancho=excluded.ancho,
+                               alto=excluded.alto, rotacion=excluded.rotacion, synced=1,
+                               updated_at=excluded.updated_at""",
+                        (tid, t.get("codigo"), t.get("nombre"), t.get("area") or "Salon principal",
+                         int(t.get("capacidad") or 0), t.get("forma") or "square", t.get("estado") or "disponible",
+                         float(t.get("pos_x") or 0), float(t.get("pos_y") or 0),
+                         float(t.get("ancho") or 16), float(t.get("alto") or 16),
+                         int(t.get("rotacion") or 0), t.get("updated_at")),
+                    )
+            # mesas borradas en el server (solo las ya sincronizadas)
+            if server_ids:
+                placeholders = ",".join("?" * len(server_ids))
+                conn.execute(
+                    f"DELETE FROM rt_tables WHERE synced=1 AND remote_id NOT IN ({placeholders})",
+                    tuple(server_ids),
+                )
+
+            # ── Ordenes abiertas ──────────────────────────────────
+            # Borra las confiadas; conserva las pendientes (synced=0).
+            conn.execute("DELETE FROM rt_consumptions WHERE synced=1")
+            conn.execute("DELETE FROM rt_orders WHERE synced=1")
+            remote_to_local_order = {}
+            for o in open_orders:
+                conn.execute(
+                    """INSERT INTO rt_orders
+                           (remote_id, table_id, estado, cliente_nombre, comensales, notas,
+                            total_acumulado, opened_at, last_activity_at, synced, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                           table_id=excluded.table_id, estado=excluded.estado,
+                           cliente_nombre=excluded.cliente_nombre, comensales=excluded.comensales,
+                           notas=excluded.notas, total_acumulado=excluded.total_acumulado,
+                           opened_at=excluded.opened_at, last_activity_at=excluded.last_activity_at,
+                           synced=1, updated_at=excluded.updated_at""",
+                    (int(o["id"]), int(o["table_id"]), o.get("estado") or "abierta",
+                     o.get("cliente_nombre"), int(o.get("comensales") or 1), o.get("notas"),
+                     float(o.get("total_acumulado") or 0), o.get("opened_at"),
+                     o.get("last_activity_at"), o.get("updated_at")),
+                )
+                lid = conn.execute("SELECT id FROM rt_orders WHERE remote_id = ?", (int(o["id"]),)).fetchone()["id"]
+                remote_to_local_order[int(o["id"])] = lid
+
+            for c in consumptions:
+                local_order = remote_to_local_order.get(int(c["order_id"]))
+                if local_order is None:
+                    continue
+                conn.execute(
+                    """INSERT INTO rt_consumptions
+                           (remote_id, order_local_id, table_id, producto_id, descripcion, cantidad,
+                            precio_unitario, subtotal, estado, notas, ordered_at, synced, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                           order_local_id=excluded.order_local_id, table_id=excluded.table_id,
+                           producto_id=excluded.producto_id, descripcion=excluded.descripcion,
+                           cantidad=excluded.cantidad, precio_unitario=excluded.precio_unitario,
+                           subtotal=excluded.subtotal, estado=excluded.estado, notas=excluded.notas,
+                           ordered_at=excluded.ordered_at, synced=1, updated_at=excluded.updated_at""",
+                    (int(c["id"]), local_order, int(c["table_id"]),
+                     c.get("producto_id"), c.get("descripcion") or "", int(c.get("cantidad") or 1),
+                     float(c.get("precio_unitario") or 0), float(c.get("subtotal") or 0),
+                     c.get("estado") or "pendiente", c.get("notas"), c.get("ordered_at"), c.get("updated_at")),
+                )
+
+    def mark_restaurant_pushed(self):
+        """Tras un push exitoso: confia todas las filas locales (synced=1) para
+        que el siguiente pull adopte la verdad del servidor sin duplicar."""
+        with self.connect() as conn:
+            conn.execute("UPDATE rt_tables SET synced=1 WHERE synced=0")
+            conn.execute("UPDATE rt_orders SET synced=1 WHERE synced=0")
+            conn.execute("UPDATE rt_consumptions SET synced=1 WHERE synced=0")
+
+    # ─── Lecturas para la UI ───────────────────────────────────────
+
+    def rt_list_areas(self):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT DISTINCT area FROM rt_tables ORDER BY area").fetchall()
+        return [r["area"] for r in rows]
+
+    def rt_list_tables(self, area: str | None = None):
+        """Mesas con metricas de su orden abierta (para la grilla del salon)."""
+        sql = """
+            SELECT t.remote_id AS id, t.codigo, t.nombre, t.area, t.capacidad,
+                   t.forma, t.estado, t.synced,
+                   o.id AS order_local_id, o.remote_id AS order_remote_id,
+                   o.cliente_nombre, o.comensales, o.total_acumulado, o.opened_at,
+                   (SELECT COUNT(*) FROM rt_consumptions c
+                      WHERE c.order_local_id = o.id AND c.estado = 'pendiente') AS pendientes,
+                   (SELECT COUNT(*) FROM rt_consumptions c
+                      WHERE c.order_local_id = o.id AND c.estado = 'servido') AS servidos,
+                   (SELECT COUNT(*) FROM rt_consumptions c
+                      WHERE c.order_local_id = o.id) AS items
+            FROM rt_tables t
+            LEFT JOIN rt_orders o ON o.table_id = t.remote_id AND o.estado = 'abierta'
+        """
+        params = []
+        if area:
+            sql += " WHERE t.area = ?"
+            params.append(area)
+        sql += " ORDER BY t.nombre"
+        with self.connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def rt_table_detail(self, table_id: int):
+        """Detalle de una mesa: su orden abierta + consumos."""
+        with self.connect() as conn:
+            table = conn.execute(
+                "SELECT remote_id AS id, codigo, nombre, area, capacidad, estado FROM rt_tables WHERE remote_id = ?",
+                (int(table_id),),
+            ).fetchone()
+            if not table:
+                return None
+            order = conn.execute(
+                """SELECT id AS order_local_id, remote_id AS order_remote_id, estado,
+                          cliente_nombre, comensales, notas, total_acumulado, opened_at, synced
+                   FROM rt_orders WHERE table_id = ? AND estado = 'abierta'
+                   ORDER BY id DESC LIMIT 1""",
+                (int(table_id),),
+            ).fetchone()
+            consumptions = []
+            if order:
+                consumptions = conn.execute(
+                    """SELECT id AS local_id, remote_id, producto_id, descripcion, cantidad,
+                              precio_unitario, subtotal, estado, notas, ordered_at, synced
+                       FROM rt_consumptions WHERE order_local_id = ?
+                       ORDER BY id""",
+                    (order["order_local_id"],),
+                ).fetchall()
+        return {
+            "table": dict(table),
+            "order": dict(order) if order else None,
+            "consumptions": [dict(c) for c in consumptions],
+        }
+
+    # ─── Operaciones (optimista local + encola outbox) ─────────────
+
+    def _rt_user_fields(self, user) -> dict:
+        """Extrae user_remote_id / user_email del objeto User (o dict) para el payload."""
+        if user is None:
+            return {}
+        remote_id = getattr(user, "remote_id", None) if not isinstance(user, dict) else user.get("remote_id")
+        email = getattr(user, "email", None) if not isinstance(user, dict) else user.get("email")
+        out = {}
+        if remote_id:
+            out["user_remote_id"] = int(remote_id)
+        if email:
+            out["user_email"] = email
+        return out
+
+    def _rt_local_open_order(self, conn, table_id: int):
+        return conn.execute(
+            "SELECT id, remote_id FROM rt_orders WHERE table_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1",
+            (int(table_id),),
+        ).fetchone()
+
+    def rt_open_table(self, table_id: int, user=None, cliente: str = "", comensales: int = 1):
+        """Abre (o asegura) la cuenta de una mesa."""
+        table_id = int(table_id)
+        with self.connect() as conn:
+            existing = self._rt_local_open_order(conn, table_id)
+            if existing:
+                return existing["id"]
+            conn.execute(
+                """INSERT INTO rt_orders (table_id, estado, cliente_nombre, comensales, synced,
+                                          opened_at, last_activity_at)
+                   VALUES (?, 'abierta', ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                (table_id, (cliente or "").strip() or None, max(1, int(comensales or 1))),
+            )
+            order_local_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute("UPDATE rt_tables SET estado='ocupada', synced=0 WHERE remote_id=?", (table_id,))
+            payload = {"op": "open_table", "table_id": table_id,
+                       "cliente_nombre": (cliente or "").strip(), "comensales": max(1, int(comensales or 1))}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+            return order_local_id
+
+    def rt_add_consumption(self, table_id: int, user=None, producto_id=None, descripcion: str = "",
+                           precio_unitario: float = 0, cantidad: int = 1, notas: str = ""):
+        """Agrega un consumo a la mesa (abre la cuenta si hace falta)."""
+        table_id = int(table_id)
+        cantidad = max(1, int(cantidad or 1))
+        descripcion = (descripcion or "").strip()
+        notas = (notas or "").strip()
+        if producto_id:
+            with self.connect() as conn:
+                prod = conn.execute("SELECT name, price FROM products WHERE remote_id = ?", (int(producto_id),)).fetchone()
+            if prod:
+                descripcion = prod["name"]
+                precio_unitario = float(prod["price"] or 0)
+        precio_unitario = float(precio_unitario or 0)
+        if not descripcion:
+            raise ValueError("Indica un producto o una descripcion.")
+        if precio_unitario <= 0:
+            raise ValueError("El precio debe ser mayor a cero.")
+        subtotal = round(precio_unitario * cantidad, 2)
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            existing = self._rt_local_open_order(conn, table_id)
+            if existing:
+                order_local_id = existing["id"]
+                conn.execute("UPDATE rt_orders SET synced=0, last_activity_at=CURRENT_TIMESTAMP WHERE id=?", (order_local_id,))
+            else:
+                conn.execute(
+                    """INSERT INTO rt_orders (table_id, estado, comensales, synced, opened_at, last_activity_at)
+                       VALUES (?, 'abierta', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    (table_id,),
+                )
+                order_local_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                """INSERT INTO rt_consumptions
+                       (order_local_id, table_id, producto_id, descripcion, cantidad,
+                        precio_unitario, subtotal, estado, notas, synced, ordered_at)
+                   VALUES (?,?,?,?,?,?,?, 'pendiente', ?, 0, CURRENT_TIMESTAMP)""",
+                (order_local_id, table_id, int(producto_id) if producto_id else None,
+                 descripcion, cantidad, precio_unitario, subtotal, notas or None),
+            )
+            # recalcula total local
+            conn.execute(
+                """UPDATE rt_orders SET total_acumulado =
+                       (SELECT COALESCE(SUM(subtotal),0) FROM rt_consumptions WHERE order_local_id=?)
+                   WHERE id=?""",
+                (order_local_id, order_local_id),
+            )
+            conn.execute("UPDATE rt_tables SET estado='ocupada', synced=0 WHERE remote_id=?", (table_id,))
+            payload = {"op": "add_consumption", "table_id": table_id, "client_op_uuid": op_uuid,
+                       "cantidad": cantidad, "notas": notas}
+            if producto_id:
+                payload["producto_id"] = int(producto_id)
+            else:
+                payload["descripcion"] = descripcion
+                payload["precio_unitario"] = precio_unitario
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", op_uuid, "create", payload)
+
+    def rt_set_consumption_state(self, consumption_local_id: int, new_state: str, user=None):
+        if new_state not in self.RT_CONSUMPTION_STATES:
+            raise ValueError("Estado de consumo invalido.")
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM rt_consumptions WHERE id=?", (int(consumption_local_id),)).fetchone()
+            if not row:
+                raise ValueError("Consumo no encontrado.")
+            conn.execute("UPDATE rt_consumptions SET estado=?, synced=0 WHERE id=?", (new_state, int(consumption_local_id)))
+            if row["remote_id"] is None:
+                # creado offline y aun sin id remoto: el cambio viaja con el add (pendiente)
+                return
+            payload = {"op": "set_consumption_state", "consumption_id": int(row["remote_id"]), "estado": new_state}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+
+    def rt_set_table_state(self, table_id: int, new_state: str, user=None):
+        if new_state not in self.RT_TABLE_STATES:
+            raise ValueError("Estado de mesa invalido.")
+        with self.connect() as conn:
+            conn.execute("UPDATE rt_tables SET estado=?, synced=0 WHERE remote_id=?", (new_state, int(table_id)))
+            payload = {"op": "set_table_state", "table_id": int(table_id), "estado": new_state}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+
+    def rt_close_table(self, table_id: int, payment_method: str = "EFECTIVO", user=None):
+        payment_method = (payment_method or "EFECTIVO").upper()
+        if payment_method not in self.RT_PAYMENT_METHODS:
+            raise ValueError("Metodo de pago invalido.")
+        table_id = int(table_id)
+        with self.connect() as conn:
+            order = self._rt_local_open_order(conn, table_id)
+            if not order:
+                raise ValueError("La mesa no tiene una cuenta abierta.")
+            items = conn.execute("SELECT COUNT(*) FROM rt_consumptions WHERE order_local_id=?", (order["id"],)).fetchone()[0]
+            if int(items or 0) <= 0:
+                raise ValueError("No puedes cerrar una cuenta sin consumos.")
+            conn.execute("UPDATE rt_orders SET estado='cerrada', synced=0 WHERE id=?", (order["id"],))
+            conn.execute("UPDATE rt_tables SET estado='disponible', synced=0 WHERE remote_id=?", (table_id,))
+            payload = {"op": "close_table", "table_id": table_id, "payment_method": payment_method}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+
+    def rt_cancel_order(self, table_id: int, reason: str = "", user=None):
+        table_id = int(table_id)
+        with self.connect() as conn:
+            order = self._rt_local_open_order(conn, table_id)
+            if not order:
+                raise ValueError("La mesa no tiene una cuenta abierta.")
+            conn.execute("UPDATE rt_orders SET estado='cancelada', synced=0 WHERE id=?", (order["id"],))
+            conn.execute("UPDATE rt_tables SET estado='disponible', synced=0 WHERE remote_id=?", (table_id,))
+            payload = {"op": "cancel_order", "table_id": table_id, "cancel_reason": (reason or "").strip()}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+
+    def rt_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='restaurant_op'"
+            ).fetchone()[0])
+
+    # ════════════════════════════════════════════════════════════════
+    # Modulo Contabilidad (espejo local + outbox)  — patrón rt_*
+    # ════════════════════════════════════════════════════════════════
+    CB_CATEGORIAS = [
+        "venta_pos", "venta_restaurante", "venta_online", "servicio", "otro_ingreso",
+        "arriendo", "nomina", "servicios_publicos", "proveedores", "impuestos",
+        "mantenimiento", "transporte", "otro_egreso",
+    ]
+
+    @staticmethod
+    def cb_calcular_impuestos(bruto, rtefte_pct=0, iva_pct=0, reteiva_pct=0, rteica_pct=0):
+        """Réplica de routes.contabilidad._calcular_impuestos (preview local)."""
+        def pct(v):
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        bruto = float(bruto or 0)
+        rtefte = round(bruto * pct(rtefte_pct) / 100, 2)
+        iva = round(bruto * pct(iva_pct) / 100, 2)
+        reteiva = round(iva * pct(reteiva_pct) / 100, 2)
+        rteica = round(bruto * pct(rteica_pct) / 100, 2)
+        total_ret = rtefte + reteiva + rteica
+        return {
+            "retefuente_monto": rtefte, "iva_monto": iva, "reteiva_monto": reteiva,
+            "reteica_monto": rteica, "total_retenciones": total_ret,
+            "monto_neto": round(bruto - total_ret, 2),
+        }
+
+    def replace_contabilidad_snapshot(self, data: dict):
+        """Reconstruye el espejo de contabilidad; conserva filas synced=0."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM cb_movimientos WHERE synced=1")
+            for m in (data.get("movimientos") or []):
+                conn.execute(
+                    """INSERT INTO cb_movimientos
+                        (remote_id, tipo, categoria, descripcion, monto_bruto, monto,
+                         retefuente_pct, retefuente_monto, iva_pct, iva_monto,
+                         reteiva_pct, reteiva_monto, reteica_pct, reteica_monto,
+                         total_retenciones, fecha, referencia_tipo, referencia_id,
+                         notas, usuario_nombre, auto_generado, synced, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                         tipo=excluded.tipo, categoria=excluded.categoria, descripcion=excluded.descripcion,
+                         monto_bruto=excluded.monto_bruto, monto=excluded.monto,
+                         retefuente_pct=excluded.retefuente_pct, retefuente_monto=excluded.retefuente_monto,
+                         iva_pct=excluded.iva_pct, iva_monto=excluded.iva_monto,
+                         reteiva_pct=excluded.reteiva_pct, reteiva_monto=excluded.reteiva_monto,
+                         reteica_pct=excluded.reteica_pct, reteica_monto=excluded.reteica_monto,
+                         total_retenciones=excluded.total_retenciones, fecha=excluded.fecha,
+                         referencia_tipo=excluded.referencia_tipo, referencia_id=excluded.referencia_id,
+                         notas=excluded.notas, usuario_nombre=excluded.usuario_nombre,
+                         auto_generado=excluded.auto_generado, synced=1, created_at=excluded.created_at""",
+                    (m.get("id"), m.get("tipo"), m.get("categoria"), m.get("descripcion"),
+                     float(m.get("monto_bruto") or 0), float(m.get("monto") or 0),
+                     float(m.get("retefuente_pct") or 0), float(m.get("retefuente_monto") or 0),
+                     float(m.get("iva_pct") or 0), float(m.get("iva_monto") or 0),
+                     float(m.get("reteiva_pct") or 0), float(m.get("reteiva_monto") or 0),
+                     float(m.get("reteica_pct") or 0), float(m.get("reteica_monto") or 0),
+                     float(m.get("total_retenciones") or 0), m.get("fecha"),
+                     m.get("referencia_tipo"), m.get("referencia_id"), m.get("notas"),
+                     m.get("usuario_nombre"), 1 if m.get("auto_generado") else 0, m.get("created_at")),
+                )
+            conn.execute("DELETE FROM cb_plantillas WHERE synced=1")
+            for p in (data.get("plantillas") or []):
+                conn.execute(
+                    """INSERT INTO cb_plantillas (remote_id, tipo, categoria, descripcion, monto_bruto, notas, activo, synced, created_at)
+                       VALUES (?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET tipo=excluded.tipo, categoria=excluded.categoria,
+                         descripcion=excluded.descripcion, monto_bruto=excluded.monto_bruto, notas=excluded.notas,
+                         activo=excluded.activo, synced=1""",
+                    (p.get("id"), p.get("tipo"), p.get("categoria"), p.get("descripcion"),
+                     float(p.get("monto_bruto") or 0), p.get("notas"), 1 if p.get("activo") else 0, p.get("created_at")),
+                )
+            conn.execute("DELETE FROM cb_cierres WHERE synced=1")
+            for c in (data.get("cierres") or []):
+                conn.execute(
+                    """INSERT INTO cb_cierres (remote_id, nombre, fecha_inicio, fecha_fin, total_ingresos,
+                         total_egresos, total_retenciones, saldo, notas, usuario_nombre, synced, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET nombre=excluded.nombre, fecha_inicio=excluded.fecha_inicio,
+                         fecha_fin=excluded.fecha_fin, total_ingresos=excluded.total_ingresos,
+                         total_egresos=excluded.total_egresos, total_retenciones=excluded.total_retenciones,
+                         saldo=excluded.saldo, notas=excluded.notas, usuario_nombre=excluded.usuario_nombre, synced=1""",
+                    (c.get("id"), c.get("nombre"), c.get("fecha_inicio"), c.get("fecha_fin"),
+                     float(c.get("total_ingresos") or 0), float(c.get("total_egresos") or 0),
+                     float(c.get("total_retenciones") or 0), float(c.get("saldo") or 0),
+                     c.get("notas"), c.get("usuario_nombre"), c.get("created_at")),
+                )
+
+    def mark_contabilidad_pushed(self):
+        with self.connect() as conn:
+            conn.execute("UPDATE cb_movimientos SET synced=1 WHERE synced=0")
+            conn.execute("UPDATE cb_plantillas SET synced=1 WHERE synced=0")
+            conn.execute("UPDATE cb_cierres SET synced=1 WHERE synced=0")
+
+    def cb_categorias(self):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT DISTINCT categoria FROM cb_movimientos WHERE categoria IS NOT NULL ORDER BY categoria").fetchall()
+        usadas = [r["categoria"] for r in rows if r["categoria"]]
+        # une las usadas con la lista base, sin duplicar
+        out = list(dict.fromkeys(self.CB_CATEGORIAS + usadas))
+        return out
+
+    @staticmethod
+    def _cb_periodo_rango(periodo: str):
+        hoy = date.today()
+        if periodo == "semana":
+            ini = hoy - timedelta(days=hoy.weekday()); fin = hoy
+        elif periodo == "mes_ant":
+            primero = hoy.replace(day=1); fin = primero - timedelta(days=1); ini = fin.replace(day=1)
+        elif periodo == "anio":
+            ini = hoy.replace(month=1, day=1); fin = hoy
+        else:  # mes
+            ini = hoy.replace(day=1); fin = hoy
+        return ini.isoformat(), fin.isoformat()
+
+    def cb_dashboard(self, periodo: str = "mes"):
+        ini, fin = self._cb_periodo_rango(periodo)
+        out = {
+            "ingresos": 0.0, "ingresos_bruto": 0.0, "egresos": 0.0, "saldo": 0.0,
+            "retenciones": 0.0, "retefuente": 0.0, "iva": 0.0, "reteiva": 0.0, "reteica": 0.0,
+            "num_ingresos": 0, "num_egresos": 0, "por_categoria": [], "ultimos": [], "rango": (ini, fin),
+        }
+        with self.connect() as conn:
+            for r in conn.execute(
+                """SELECT tipo, COALESCE(SUM(monto),0) neto, COALESCE(SUM(monto_bruto),0) bruto,
+                          COALESCE(SUM(total_retenciones),0) ret, COALESCE(SUM(retefuente_monto),0) rf,
+                          COALESCE(SUM(iva_monto),0) iva, COALESCE(SUM(reteiva_monto),0) ri,
+                          COALESCE(SUM(reteica_monto),0) ric, COUNT(*) cnt
+                   FROM cb_movimientos WHERE fecha BETWEEN ? AND ? GROUP BY tipo""", (ini, fin)):
+                if r["tipo"] == "ingreso":
+                    out["ingresos"] = float(r["neto"]); out["ingresos_bruto"] = float(r["bruto"])
+                    out["retenciones"] = float(r["ret"]); out["retefuente"] = float(r["rf"])
+                    out["iva"] = float(r["iva"]); out["reteiva"] = float(r["ri"]); out["reteica"] = float(r["ric"])
+                    out["num_ingresos"] = r["cnt"]
+                else:
+                    out["egresos"] = float(r["neto"]); out["num_egresos"] = r["cnt"]
+            out["saldo"] = out["ingresos"] - out["egresos"]
+            out["por_categoria"] = [dict(r) for r in conn.execute(
+                """SELECT categoria, tipo, COALESCE(SUM(monto),0) total, COUNT(*) cnt
+                   FROM cb_movimientos WHERE fecha BETWEEN ? AND ?
+                   GROUP BY categoria, tipo ORDER BY total DESC LIMIT 8""", (ini, fin))]
+            out["ultimos"] = [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, tipo, categoria, descripcion, monto, fecha,
+                          auto_generado, synced
+                   FROM cb_movimientos ORDER BY fecha DESC, id DESC LIMIT 10""")]
+        return out
+
+    def cb_list_movimientos(self, tipo=None, categoria=None, fecha_ini=None, fecha_fin=None, limit=500):
+        sql = """SELECT id AS local_id, remote_id, tipo, categoria, descripcion, monto_bruto, monto,
+                        total_retenciones, fecha, notas, usuario_nombre, auto_generado, synced
+                 FROM cb_movimientos WHERE 1=1"""
+        params = []
+        if tipo in ("ingreso", "egreso"):
+            sql += " AND tipo=?"; params.append(tipo)
+        if categoria:
+            sql += " AND categoria=?"; params.append(categoria)
+        if fecha_ini:
+            sql += " AND fecha>=?"; params.append(fecha_ini)
+        if fecha_fin:
+            sql += " AND fecha<=?"; params.append(fecha_fin)
+        sql += " ORDER BY fecha DESC, id DESC LIMIT ?"; params.append(int(limit))
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, tuple(params))]
+
+    def cb_list_plantillas(self):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id AS local_id, remote_id, tipo, categoria, descripcion, monto_bruto, notas, activo, synced FROM cb_plantillas ORDER BY id")]
+
+    def cb_list_cierres(self):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id AS local_id, remote_id, nombre, fecha_inicio, fecha_fin, total_ingresos, total_egresos, total_retenciones, saldo, notas, usuario_nombre, synced FROM cb_cierres ORDER BY fecha_fin DESC, id DESC")]
+
+    def cb_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='contabilidad_op'").fetchone()[0])
+
+    # ─── Operaciones (optimista local + outbox) ───────────────────
+
+    def cb_crear_movimiento(self, tipo, categoria, descripcion, monto_bruto, fecha=None,
+                            notas="", retefuente_pct=0, iva_pct=0, reteiva_pct=0, reteica_pct=0, user=None):
+        tipo = (tipo or "").strip()
+        if tipo not in ("ingreso", "egreso"):
+            raise ValueError("Tipo inválido.")
+        descripcion = (descripcion or "").strip()
+        if not descripcion:
+            raise ValueError("La descripción es obligatoria.")
+        bruto = float(monto_bruto or 0)
+        if bruto <= 0:
+            raise ValueError("El monto debe ser mayor a cero.")
+        if tipo == "egreso":
+            retefuente_pct = iva_pct = reteiva_pct = reteica_pct = 0
+        calc = self.cb_calcular_impuestos(bruto, retefuente_pct, iva_pct, reteiva_pct, reteica_pct)
+        neto = calc["monto_neto"] if tipo == "ingreso" else bruto
+        fecha = fecha or date.today().isoformat()
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO cb_movimientos
+                    (tipo, categoria, descripcion, monto_bruto, monto, retefuente_pct, retefuente_monto,
+                     iva_pct, iva_monto, reteiva_pct, reteiva_monto, reteica_pct, reteica_monto,
+                     total_retenciones, fecha, notas, auto_generado, synced, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,CURRENT_TIMESTAMP)""",
+                (tipo, (categoria or "otro").strip() or "otro", descripcion, bruto, neto,
+                 float(retefuente_pct or 0), calc["retefuente_monto"], float(iva_pct or 0), calc["iva_monto"],
+                 float(reteiva_pct or 0), calc["reteiva_monto"], float(reteica_pct or 0), calc["reteica_monto"],
+                 calc["total_retenciones"], fecha, (notas or "").strip() or None),
+            )
+            payload = {"op": "create_movimiento", "client_op_uuid": op_uuid, "tipo": tipo,
+                       "categoria": (categoria or "otro").strip() or "otro", "descripcion": descripcion,
+                       "monto_bruto": bruto, "fecha": fecha, "notas": (notas or "").strip(),
+                       "retefuente_pct": float(retefuente_pct or 0), "iva_pct": float(iva_pct or 0),
+                       "reteiva_pct": float(reteiva_pct or 0), "reteica_pct": float(reteica_pct or 0)}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "contabilidad_op", op_uuid, "create", payload)
+
+    def cb_eliminar_movimiento(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id, auto_generado FROM cb_movimientos WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Movimiento no encontrado.")
+            if row["auto_generado"]:
+                raise ValueError("Los movimientos automáticos (ventas POS/restaurante) no se pueden eliminar.")
+            conn.execute("DELETE FROM cb_movimientos WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_movimiento", "movimiento_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_crear_plantilla(self, tipo, categoria, descripcion, monto_bruto, notas="", user=None):
+        if tipo not in ("ingreso", "egreso"):
+            raise ValueError("Tipo inválido.")
+        bruto = float(monto_bruto or 0)
+        if bruto <= 0:
+            raise ValueError("El monto debe ser mayor a cero.")
+        descripcion = (descripcion or "").strip()
+        if not descripcion:
+            raise ValueError("La descripción es obligatoria.")
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO cb_plantillas (tipo, categoria, descripcion, monto_bruto, notas, activo, synced) VALUES (?,?,?,?,?,1,0)",
+                (tipo, (categoria or "otro").strip() or "otro", descripcion, bruto, (notas or "").strip() or None),
+            )
+            payload = {"op": "create_plantilla", "tipo": tipo, "categoria": (categoria or "otro").strip() or "otro",
+                       "descripcion": descripcion, "monto_bruto": bruto, "notas": (notas or "").strip()}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_toggle_plantilla(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id, activo FROM cb_plantillas WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Plantilla no encontrada.")
+            conn.execute("UPDATE cb_plantillas SET activo = 1-activo, synced=0 WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "toggle_plantilla", "plantilla_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_eliminar_plantilla(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM cb_plantillas WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Plantilla no encontrada.")
+            conn.execute("DELETE FROM cb_plantillas WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_plantilla", "plantilla_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_generar_plantillas(self, user=None):
+        """Encola la generación server-side (anti-dup). El resultado baja en el próximo pull."""
+        with self.connect() as conn:
+            payload = {"op": "generar_plantillas"}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_crear_cierre(self, nombre, fecha_inicio, fecha_fin, notas="", user=None):
+        nombre = (nombre or "").strip()
+        if not nombre or not fecha_inicio or not fecha_fin:
+            raise ValueError("Nombre y rango de fechas son obligatorios.")
+        with self.connect() as conn:
+            payload = {"op": "create_cierre", "nombre": nombre, "fecha_inicio": fecha_inicio,
+                       "fecha_fin": fecha_fin, "notas": (notas or "").strip()}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
+    def cb_eliminar_cierre(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM cb_cierres WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Cierre no encontrado.")
+            conn.execute("DELETE FROM cb_cierres WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_cierre", "cierre_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "contabilidad_op", _uuid.uuid4().hex, "create", payload)
+
     def upsert_user_from_remote(self, remote):
         """Sincroniza perfil de usuario (sin password).
 
@@ -1165,6 +1844,130 @@ class LocalStore:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     synced_at TEXT
                 );
+                """
+            )
+
+            # ── Modulo Restaurante: espejo local de las tablas de produccion ──
+            # remote_id es el id del servidor (None mientras no se haya sincronizado).
+            # synced=0 marca filas con cambios locales aun no confirmados por el VPS.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS rt_tables (
+                    remote_id INTEGER PRIMARY KEY,
+                    codigo TEXT,
+                    nombre TEXT NOT NULL,
+                    area TEXT NOT NULL DEFAULT 'Salon principal',
+                    capacidad INTEGER NOT NULL DEFAULT 4,
+                    forma TEXT NOT NULL DEFAULT 'square',
+                    estado TEXT NOT NULL DEFAULT 'disponible',
+                    pos_x REAL NOT NULL DEFAULT 0,
+                    pos_y REAL NOT NULL DEFAULT 0,
+                    ancho REAL NOT NULL DEFAULT 16,
+                    alto REAL NOT NULL DEFAULT 16,
+                    rotacion INTEGER NOT NULL DEFAULT 0,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS rt_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    table_id INTEGER NOT NULL,
+                    estado TEXT NOT NULL DEFAULT 'abierta',
+                    cliente_nombre TEXT,
+                    comensales INTEGER NOT NULL DEFAULT 1,
+                    notas TEXT,
+                    total_acumulado REAL NOT NULL DEFAULT 0,
+                    opened_at TEXT,
+                    last_activity_at TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS rt_consumptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    order_local_id INTEGER NOT NULL,
+                    table_id INTEGER NOT NULL,
+                    producto_id INTEGER,
+                    descripcion TEXT NOT NULL,
+                    cantidad INTEGER NOT NULL DEFAULT 1,
+                    precio_unitario REAL NOT NULL DEFAULT 0,
+                    subtotal REAL NOT NULL DEFAULT 0,
+                    estado TEXT NOT NULL DEFAULT 'pendiente',
+                    notas TEXT,
+                    ordered_at TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_rt_orders_table ON rt_orders(table_id, estado);
+                CREATE INDEX IF NOT EXISTS idx_rt_consumptions_order ON rt_consumptions(order_local_id, estado);
+                CREATE INDEX IF NOT EXISTS idx_rt_tables_area ON rt_tables(area);
+                """
+            )
+
+            # ── Modulo Contabilidad: espejo local de las tablas de produccion ──
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS cb_movimientos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    tipo TEXT NOT NULL,
+                    categoria TEXT,
+                    descripcion TEXT NOT NULL,
+                    monto_bruto REAL NOT NULL DEFAULT 0,
+                    monto REAL NOT NULL DEFAULT 0,
+                    retefuente_pct REAL NOT NULL DEFAULT 0,
+                    retefuente_monto REAL NOT NULL DEFAULT 0,
+                    iva_pct REAL NOT NULL DEFAULT 0,
+                    iva_monto REAL NOT NULL DEFAULT 0,
+                    reteiva_pct REAL NOT NULL DEFAULT 0,
+                    reteiva_monto REAL NOT NULL DEFAULT 0,
+                    reteica_pct REAL NOT NULL DEFAULT 0,
+                    reteica_monto REAL NOT NULL DEFAULT 0,
+                    total_retenciones REAL NOT NULL DEFAULT 0,
+                    fecha TEXT,
+                    referencia_tipo TEXT,
+                    referencia_id INTEGER,
+                    notas TEXT,
+                    usuario_nombre TEXT,
+                    auto_generado INTEGER NOT NULL DEFAULT 0,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS cb_plantillas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    tipo TEXT NOT NULL,
+                    categoria TEXT,
+                    descripcion TEXT NOT NULL,
+                    monto_bruto REAL NOT NULL DEFAULT 0,
+                    notas TEXT,
+                    activo INTEGER NOT NULL DEFAULT 1,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS cb_cierres (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    nombre TEXT NOT NULL,
+                    fecha_inicio TEXT,
+                    fecha_fin TEXT,
+                    total_ingresos REAL NOT NULL DEFAULT 0,
+                    total_egresos REAL NOT NULL DEFAULT 0,
+                    total_retenciones REAL NOT NULL DEFAULT 0,
+                    saldo REAL NOT NULL DEFAULT 0,
+                    notas TEXT,
+                    usuario_nombre TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cb_mov_fecha ON cb_movimientos(fecha, tipo);
+                CREATE INDEX IF NOT EXISTS idx_cb_mov_cat ON cb_movimientos(categoria);
                 """
             )
 

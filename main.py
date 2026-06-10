@@ -3,7 +3,7 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -46,7 +48,26 @@ from sync_client import SyncClient, SyncError
 
 
 APP_VERSION = "1.0.0"
-ROLES = ["Administrador", "Cajero", "Inventario"]
+ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
+
+# Módulos visibles por rol — espejo de los grupos de permisos de security.py
+# del backend (ADMIN_FULL, ADMIN_STAFF, POS_OPERATIONAL, RESTAURANT_*…).
+# Claves = keys de NAV_ITEMS.
+ROLE_MODULES = {
+    "Administrador": {"dashboard", "pos", "restaurant", "sales", "products", "inventory", "contabilidad", "users", "sync", "config"},
+    "Empleado":      {"dashboard", "pos", "restaurant", "sales", "products", "inventory"},
+    "Cajero":        {"dashboard", "pos", "restaurant", "sales"},
+    "Mesero":        {"dashboard", "pos", "restaurant"},
+    "Contador":      {"dashboard", "sales", "contabilidad"},
+    "Cliente":       {"dashboard"},               # no debería operar el POS
+    # Compatibilidad con el mapeo viejo
+    "Inventario":    {"dashboard", "products", "inventory", "sales"},
+}
+DEFAULT_ROLE_MODULES = {"dashboard", "pos"}  # fallback prudente para roles desconocidos
+
+
+def modules_for_role(role: str) -> set:
+    return ROLE_MODULES.get((role or "").strip(), DEFAULT_ROLE_MODULES)
 
 
 def _asset_path(name: str) -> Path:
@@ -98,7 +119,7 @@ QSS_TEMPLATE = """
    CyberShop POS Desktop — Design System
    Tokens (vienen de branding.json):
      $primario, $primario_oscuro, $acento, $acento_secundario,
-     $peligro, $sidebar_inicio, $sidebar_fin, $fondo
+     $peligro, $sidebar_inicio, $sidebar_fin, $fondo, $superficie
      y sus _rgb (R, G, B) para usar en rgba().
    Convenciones:
      - Radios: 8px chips, 12px botones/inputs, 16-22px tarjetas
@@ -114,6 +135,13 @@ QWidget {
     color: #1f2937;
     background: $fondo;
 }
+/* Los QLabel son transparentes por defecto para que se vea el fondo real de
+   la tarjeta/panel que los contiene. Sin esto, cada label pinta un rectangulo
+   opaco con el $fondo global y aparecen "parches" de color dentro de las
+   tarjetas. Los labels que necesitan fondo propio (syncBadge, userAvatar,
+   moduleCardIcon...) lo declaran via su selector de id, que tiene mayor
+   especificidad y gana sobre esta regla. */
+QLabel { background: transparent; }
 QToolTip {
     background: #1f2937;
     color: #f9fafb;
@@ -311,7 +339,7 @@ QLabel#highlightText {
 
 /* ─── Tarjetas y paneles ────────────────────────────────────────── */
 QFrame#metricCard, QFrame#sectionPanel, QFrame#loginCard {
-    background: #ffffff;
+    background: $superficie;
     border: 1px solid rgba($primario_rgb, 0.16);
     border-radius: 14px;
 }
@@ -344,7 +372,7 @@ QLabel#metricLabel {
 QFrame#dashboardHero {
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:1,
-        stop:0 #ffffff,
+        stop:0 $superficie,
         stop:1 rgba($primario_rgb, 0.05)
     );
     border: 1px solid rgba($primario_rgb, 0.18);
@@ -359,7 +387,7 @@ QFrame#heroHighlight {
 
 /* ─── Module grid (atajos a módulos) ─────────────────────────── */
 QFrame#moduleCard {
-    background: #ffffff;
+    background: $superficie;
     border: 1px solid rgba($primario_rgb, 0.16);
     border-radius: 12px;
 }
@@ -720,18 +748,162 @@ QLabel#pageBadge[state="danger"] {
 
 /* ─── Misc ──────────────────────────────────────────────────────── */
 QFrame#colorSwatch {
-    border: 1px solid rgba(0,0,0,0.12);
-    border-radius: 6px;
-    min-width: 26px;
-    min-height: 26px;
-    max-width: 26px;
-    max-height: 26px;
+    border: 1px solid rgba(0,0,0,0.14);
+    border-radius: 8px;
+    min-width: 30px;
+    min-height: 30px;
+    max-width: 30px;
+    max-height: 30px;
 }
 QFrame#divider {
     background: rgba($primario_rgb, 0.10);
     max-height: 1px;
     min-height: 1px;
 }
+
+/* ─── Pagina de Configuracion / Marca ───────────────────────────── */
+QScrollArea#configScroll {
+    border: 0;
+    background: transparent;
+}
+QScrollArea#configScroll > QWidget > QWidget { background: transparent; }
+QLabel#sectionTitle {
+    color: $primario_oscuro;
+    font-size: 16px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+}
+QLabel#sectionDesc {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 500;
+}
+QLabel#colorGroupLabel {
+    color: $primario;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+}
+QLabel#colorHint {
+    color: #9ca3af;
+    font-size: 11px;
+    font-weight: 500;
+}
+QLabel#fieldLabel {
+    color: #374151;
+    font-size: 13px;
+    font-weight: 600;
+}
+QFrame#actionBar {
+    background: $superficie;
+    border-top: 1px solid rgba($primario_rgb, 0.16);
+}
+QLineEdit#hexInput {
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    letter-spacing: 0.5px;
+}
+
+/* ─── Restaurante: salón y mesas ─────────────────────────────────── */
+QFrame#rtTableCard {
+    background: $superficie;
+    border: 1px solid rgba($primario_rgb, 0.16);
+    border-left: 5px solid rgba($primario_rgb, 0.30);
+    border-radius: 12px;
+}
+QFrame#rtTableCard[estado="disponible"] { border-left-color: $acento_secundario; }
+QFrame#rtTableCard[estado="ocupada"]    { border-left-color: $acento; background: rgba($acento_rgb, 0.05); }
+QFrame#rtTableCard[estado="reservada"]  { border-left-color: $primario; background: rgba($primario_rgb, 0.05); }
+QFrame#rtTableCard[estado="cuenta_solicitada"] { border-left-color: $peligro; background: rgba($peligro_rgb, 0.06); }
+QFrame#rtTableCard[selected="true"] {
+    border: 2px solid $primario;
+    border-left: 5px solid $primario;
+}
+QLabel#rtCardName { font-size: 15px; font-weight: 800; color: $primario_oscuro; }
+QLabel#rtCardBadge {
+    font-size: 10px; font-weight: 800; color: #6b7280;
+    text-transform: uppercase; letter-spacing: 0.6px;
+}
+QLabel#rtCardMeta { font-size: 11px; color: #6b7280; font-weight: 600; }
+QLabel#rtCardTotal { font-size: 20px; font-weight: 850; color: $primario; letter-spacing: -0.3px; }
+QLabel#rtCardFree { font-size: 13px; font-weight: 700; color: $acento_secundario; }
+QLabel#rtCardPending { font-size: 10px; font-weight: 700; color: $acento; }
+
+QLabel#rtDetailTitle { font-size: 18px; font-weight: 800; color: $primario_oscuro; }
+QLabel#rtDetailTotal { font-size: 18px; font-weight: 850; color: $primario; padding: 4px 0; }
+QFrame#rtAddBox {
+    background: rgba($primario_rgb, 0.04);
+    border: 1px solid rgba($primario_rgb, 0.14);
+    border-radius: 10px;
+}
+QFrame#rtConsRow {
+    background: $superficie;
+    border: 1px solid rgba($primario_rgb, 0.10);
+    border-radius: 8px;
+}
+QLabel#rtConsText { font-size: 13px; font-weight: 600; color: #1f2937; }
+QLabel#rtConsSub { font-size: 13px; font-weight: 800; color: $primario_oscuro; }
+QPushButton#rtStateBtn {
+    border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: 800;
+    border: 1px solid rgba($primario_rgb, 0.20); color: $primario_oscuro;
+    background: rgba($primario_rgb, 0.06);
+}
+QPushButton#rtStateBtn[estado="pendiente"]  { background: rgba($peligro_rgb, 0.12); border-color: rgba($peligro_rgb, 0.35); color: $peligro; }
+QPushButton#rtStateBtn[estado="preparando"] { background: rgba(255, 184, 0, 0.18); border-color: rgba(255, 184, 0, 0.45); color: #8a5a00; }
+QPushButton#rtStateBtn[estado="servido"]    { background: rgba($acento_secundario_rgb, 0.20); border-color: rgba($acento_secundario_rgb, 0.50); color: $primario_oscuro; }
+QPushButton#rtStateBtn:hover { border-color: $primario; }
+QLabel#rtSyncLabel { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px; }
+QLabel#rtSyncLabel[state="ok"] { color: $primario_oscuro; background: rgba($acento_secundario_rgb, 0.18); }
+QLabel#rtSyncLabel[state="pending"] { color: $acento; background: rgba($acento_rgb, 0.14); }
+QLabel#rtConsNotas { font-size: 11px; color: #6b7280; font-weight: 500; }
+QLabel#rtHint { font-size: 11px; color: #6b7280; font-weight: 500; padding-bottom: 2px; }
+/* Pill de estado en el panel de detalle */
+QLabel#rtStatePill {
+    font-size: 11px; font-weight: 800; padding: 4px 12px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: 0.4px;
+    color: #6b7280; background: rgba(0,0,0,0.06);
+}
+QLabel#rtStatePill[estado="disponible"] { color: $primario_oscuro; background: rgba($acento_secundario_rgb, 0.22); }
+QLabel#rtStatePill[estado="ocupada"]    { color: #8a5a00; background: rgba($acento_rgb, 0.18); }
+QLabel#rtStatePill[estado="reservada"]  { color: $primario; background: rgba($primario_rgb, 0.14); }
+QLabel#rtStatePill[estado="cuenta_solicitada"] { color: $peligro; background: rgba($peligro_rgb, 0.14); }
+/* Leyenda de colores */
+QLabel#rtLegend { font-size: 12px; font-weight: 700; color: #6b7280; }
+QLabel#rtLegend[estado="disponible"] { color: $acento_secundario; }
+QLabel#rtLegend[estado="ocupada"]    { color: $acento; }
+QLabel#rtLegend[estado="reservada"]  { color: $primario; }
+QLabel#rtLegend[estado="cuenta_solicitada"] { color: $peligro; }
+/* Barra de progreso de preparación */
+QFrame#rtProgressBox {
+    background: rgba($primario_rgb, 0.04);
+    border: 1px solid rgba($primario_rgb, 0.12);
+    border-radius: 10px;
+}
+QLabel#rtProgPct { font-size: 13px; font-weight: 850; color: $primario; }
+QFrame#rtProgBar { min-height: 14px; max-height: 14px; border-radius: 7px; }
+QFrame#rtProgSeg { min-height: 14px; }
+QFrame#rtProgSeg[estado="servido"]    { background: $acento_secundario; }
+QFrame#rtProgSeg[estado="preparando"] { background: #f5a623; }
+QFrame#rtProgSeg[estado="pendiente"]  { background: rgba($peligro_rgb, 0.55); }
+QFrame#rtProgSeg[estado="vacio"]      { background: rgba(0,0,0,0.08); }
+QLabel#rtProgLegend { font-size: 11px; font-weight: 600; color: #6b7280; }
+/* Recibo (vista cajero) */
+QFrame#rtReceipt {
+    background: $superficie;
+    border: 1px solid rgba($primario_rgb, 0.14);
+    border-radius: 10px;
+}
+QLabel#rtRcptQty { font-size: 14px; font-weight: 800; color: $primario; }
+QLabel#rtRcptName { font-size: 14px; font-weight: 600; color: #1f2937; }
+QLabel#rtRcptSub { font-size: 14px; font-weight: 800; color: $primario_oscuro; }
+QLabel#rtRcptChip {
+    font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+}
+QLabel#rtRcptChip[estado="servido"]    { color: $primario_oscuro; background: rgba($acento_secundario_rgb, 0.22); }
+QLabel#rtRcptChip[estado="preparando"] { color: #8a5a00; background: rgba(255,184,0,0.20); }
+QLabel#rtRcptChip[estado="pendiente"]  { color: $peligro; background: rgba($peligro_rgb, 0.12); }
+QLabel#rtCashierTotal { font-size: 32px; font-weight: 850; color: $primario; letter-spacing: -0.5px; }
 """
 
 
@@ -3083,6 +3255,8 @@ class SyncPage(QWidget):
         if self._sync_state.get("enabled") and self._sync_state.get("base_url") and self._sync_state.get("api_key"):
             interval_ms = max(5, int(self._sync_state.get("interval_sec", 30))) * 1000
             self._auto_timer.start(interval_ms)
+            # Sync inicial poco después de arrancar (no esperar al primer tick).
+            QTimer.singleShot(1500, self._sync_now_silent)
 
     def _build_client(self):
         return SyncClient(self._sync_state.get("base_url", ""), self._sync_state.get("api_key", ""))
@@ -3156,13 +3330,18 @@ class SyncPage(QWidget):
         """
         client = self._build_client()
         stats = {"pulled_generos": 0, "pulled_products": 0, "pulled_users": 0,
-                 "pulled_sales_web": 0, "pulled_inventory_log": 0,
+                 "pulled_sales_web": 0, "pulled_inventory_log": 0, "pulled_restaurant": 0, "pulled_contabilidad": 0,
                  "pushed_applied": 0, "pushed_skipped": 0, "pushed_stale": 0,
                  "pushed_errors": 0}
 
         # --- Pull generos ---
+        # Auto-sanación: si la tabla local está vacía pero el cursor quedó
+        # adelantado (p. ej. tras 'Limpiar datos'), forzar pull completo.
         try:
-            r = client.pull_generos(since=self._sync_state.get("cursor_generos") or None)
+            gen_since = self._sync_state.get("cursor_generos") or None
+            if self.store.count_generos() == 0:
+                gen_since = None
+            r = client.pull_generos(since=gen_since)
             for g in r.get("items", []):
                 try:
                     self.store.upsert_genero_from_remote(g)
@@ -3178,6 +3357,8 @@ class SyncPage(QWidget):
         # --- Pull productos (incluyendo tombstones) ---
         try:
             since = self._sync_state.get("cursor_products") or self._sync_state.get("last_pull_at") or None
+            if self.store.count_products() == 0:
+                since = None  # auto-sanación: tabla vacía → pull completo
             r = client.pull_products(since=since, limit=500, include_inactive=True)
             for p in r.get("items", []):
                 try:
@@ -3236,6 +3417,26 @@ class SyncPage(QWidget):
         except SyncError as exc:
             print(f"[sync] pull_inventory_log: {exc}")
 
+        # --- Pull restaurant snapshot (módulo de mesas) ---
+        try:
+            snap = client.pull_restaurant_snapshot()
+            self.store.replace_restaurant_snapshot(snap)
+            stats["pulled_restaurant"] = len(snap.get("tables", []))
+        except SyncError as exc:
+            print(f"[sync] pull_restaurant_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001 — no romper el ciclo por restaurante
+            print(f"[sync] restaurant snapshot fallo: {exc}")
+
+        # --- Pull contabilidad snapshot ---
+        try:
+            csnap = client.pull_contabilidad_snapshot()
+            self.store.replace_contabilidad_snapshot(csnap)
+            stats["pulled_contabilidad"] = len(csnap.get("movimientos", []))
+        except SyncError as exc:
+            print(f"[sync] pull_contabilidad_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync] contabilidad snapshot fallo: {exc}")
+
         # --- Push outbox ---
         pending = self.store.pending_outbox(limit=100)
         if pending:
@@ -3261,6 +3462,12 @@ class SyncPage(QWidget):
                     else:
                         stats["pushed_errors"] += 1
                 self.store.mark_outbox_synced(done_ids)
+                # Confía las filas de restaurante empujadas para que el próximo
+                # pull adopte la verdad del servidor sin duplicar.
+                if any(p["entity"] == "restaurant_op" for p in pending):
+                    self.store.mark_restaurant_pushed()
+                if any(p["entity"] == "contabilidad_op" for p in pending):
+                    self.store.mark_contabilidad_pushed()
             except SyncError as exc:
                 print(f"[sync] push_outbox: {exc}")
                 stats["pushed_errors"] += len(pending)
@@ -3321,6 +3528,21 @@ COLOR_FIELDS = [
     ("sidebar_inicio", "Sidebar gradiente inicio"),
     ("sidebar_fin", "Sidebar gradiente fin"),
     ("fondo", "Fondo general"),
+    ("superficie", "Superficie de tarjetas (fondo de cards/paneles)"),
+]
+# Agrupacion visual de los colores en la pantalla de Configuracion.
+# (titulo de grupo, descripcion, lista de claves de COLOR_FIELDS).
+COLOR_GROUPS = [
+    (
+        "Identidad de marca",
+        "Colores principales de botones, enlaces, acentos y estados.",
+        ["primario", "primario_oscuro", "acento", "acento_secundario", "peligro"],
+    ),
+    (
+        "Interfaz y superficies",
+        "Menu lateral, lienzo general y fondo de las tarjetas.",
+        ["sidebar_inicio", "sidebar_fin", "fondo", "superficie"],
+    ),
 ]
 EMPRESA_FIELDS = [
     ("nombre", "Nombre de la empresa"),
@@ -3342,24 +3564,31 @@ class ColorPickerRow(QWidget):
         self.key = key
         self.on_change = on_change
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(10)
 
         self.label = QLabel(label)
-        self.label.setMinimumWidth(220)
+        self.label.setObjectName("fieldLabel")
+        self.label.setMinimumWidth(280)
+        self.label.setWordWrap(True)
         self.swatch = QFrame()
         self.swatch.setObjectName("colorSwatch")
         self.input = QLineEdit(value)
+        self.input.setObjectName("hexInput")
         self.input.setMaxLength(9)
+        self.input.setFixedWidth(120)
+        self.input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.input.textChanged.connect(self._on_text_change)
         self.input.editingFinished.connect(self._notify)
         button = QPushButton("Elegir...")
         button.setObjectName("secondaryAction")
+        button.setMinimumWidth(96)
         button.clicked.connect(self._open_picker)
 
         layout.addWidget(self.label)
+        layout.addStretch(1)
         layout.addWidget(self.swatch)
-        layout.addWidget(self.input, 1)
+        layout.addWidget(self.input)
         layout.addWidget(button)
         self._refresh_swatch(value)
 
@@ -3404,39 +3633,81 @@ class ConfiguracionPage(QWidget):
         self._empresa_inputs = {}
         self._build()
 
-    def _build(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(14)
+    @staticmethod
+    def _section_panel(title: str, desc: str):
+        """Crea un panel de seccion con encabezado (titulo + descripcion) y un
+        separador. Devuelve (panel, content_layout) para seguir agregando."""
+        panel = QFrame()
+        panel.setObjectName("sectionPanel")
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(20, 18, 20, 20)
+        outer.setSpacing(12)
 
-        title = QLabel("Configuracion / Marca")
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        desc_label = QLabel(desc)
+        desc_label.setObjectName("sectionDesc")
+        desc_label.setWordWrap(True)
+        head.addWidget(title_label)
+        head.addWidget(desc_label)
+        outer.addLayout(head)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        outer.addWidget(divider)
+        return panel, outer
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Contenido desplazable ───────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setObjectName("configScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+        scroll.setWidget(content)
+
+        title = QLabel("Configuración / Marca")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
         intro = QLabel(
-            "Personaliza colores, datos y logo para este cliente. Los cambios se "
-            "aplican al instante y se guardan en branding.json al pulsar 'Guardar y aplicar'."
+            "Personaliza la identidad de este cliente. Los cambios se previsualizan "
+            "al instante y se guardan en branding.json al pulsar 'Guardar y aplicar'."
         )
         intro.setObjectName("muted")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # Datos de empresa
-        empresa_panel = QFrame()
-        empresa_panel.setObjectName("sectionPanel")
-        empresa_form = QFormLayout(empresa_panel)
-        empresa_form.setContentsMargins(16, 16, 16, 16)
-        empresa_form.setSpacing(10)
-        empresa_title = QLabel("Datos de la empresa")
-        empresa_title.setObjectName("eyebrow")
-        empresa_form.addRow(empresa_title)
+        # ── Seccion: Datos de la empresa ────────────────────────────
+        empresa_panel, empresa_outer = self._section_panel(
+            "Datos de la empresa",
+            "Identidad textual que aparece en el login, la ventana y los recibos del POS.",
+        )
+        empresa_form = QFormLayout()
+        empresa_form.setContentsMargins(0, 0, 0, 0)
+        empresa_form.setHorizontalSpacing(18)
+        empresa_form.setVerticalSpacing(12)
+        empresa_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        empresa_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         for key, label in EMPRESA_FIELDS:
             input_field = QLineEdit(self._state["empresa"].get(key, ""))
             self._empresa_inputs[key] = input_field
-            empresa_form.addRow(label + ":", input_field)
+            field_label = QLabel(label + ":")
+            field_label.setObjectName("fieldLabel")
+            empresa_form.addRow(field_label, input_field)
 
         # Logo
         logo_row = QHBoxLayout()
+        logo_row.setSpacing(8)
         self.logo_path_input = QLineEdit(self._state["empresa"].get("logo_path", ""))
         self.logo_path_input.setPlaceholderText("Ruta absoluta al archivo PNG/JPG (opcional)")
         browse = QPushButton("Examinar...")
@@ -3448,61 +3719,74 @@ class ConfiguracionPage(QWidget):
         logo_row.addWidget(self.logo_path_input, 1)
         logo_row.addWidget(browse)
         logo_row.addWidget(clear_logo)
-        empresa_form.addRow("Logo:", logo_row)
-
+        logo_label = QLabel("Logo:")
+        logo_label.setObjectName("fieldLabel")
+        empresa_form.addRow(logo_label, _wrap_layout(logo_row))
+        empresa_outer.addLayout(empresa_form)
         layout.addWidget(empresa_panel)
 
-        # Colores
-        color_panel = QFrame()
-        color_panel.setObjectName("sectionPanel")
-        color_layout = QVBoxLayout(color_panel)
-        color_layout.setContentsMargins(16, 16, 16, 16)
-        color_layout.setSpacing(8)
-        color_title = QLabel("Colores de marca")
-        color_title.setObjectName("eyebrow")
-        color_layout.addWidget(color_title)
-
-        for key, label in COLOR_FIELDS:
-            row = ColorPickerRow(
-                key,
-                label,
-                self._state["colores"].get(key, branding_mod.DEFAULTS["colores"][key]),
-                on_change=None,
-            )
-            self._color_rows[key] = row
-            color_layout.addWidget(row)
-
+        # ── Seccion: Colores de marca (agrupados) ───────────────────
+        color_panel, color_outer = self._section_panel(
+            "Colores de marca",
+            "Cada color usa formato hexadecimal (#RRGGBB). Usa 'Elegir...' para "
+            "abrir el selector visual.",
+        )
+        labels = dict(COLOR_FIELDS)
+        for gi, (group_title, group_desc, keys) in enumerate(COLOR_GROUPS):
+            if gi > 0:
+                color_outer.addSpacing(4)
+            group_label = QLabel(group_title)
+            group_label.setObjectName("colorGroupLabel")
+            color_outer.addWidget(group_label)
+            group_hint = QLabel(group_desc)
+            group_hint.setObjectName("colorHint")
+            group_hint.setWordWrap(True)
+            color_outer.addWidget(group_hint)
+            for key in keys:
+                row = ColorPickerRow(
+                    key,
+                    labels.get(key, key),
+                    self._state["colores"].get(key, branding_mod.DEFAULTS["colores"][key]),
+                    on_change=None,
+                )
+                self._color_rows[key] = row
+                color_outer.addWidget(row)
         layout.addWidget(color_panel)
+        layout.addStretch(1)
 
-        # Acciones
-        actions = QHBoxLayout()
-        save_btn = QPushButton("Guardar y aplicar")
-        save_btn.setObjectName("primaryAction")
-        save_btn.clicked.connect(self._save_apply)
-        preview_btn = QPushButton("Previsualizar (sin guardar)")
-        preview_btn.setObjectName("secondaryAction")
-        preview_btn.clicked.connect(self._preview)
-        export_btn = QPushButton("Exportar JSON...")
-        export_btn.setObjectName("secondaryAction")
-        export_btn.clicked.connect(self._export)
-        import_btn = QPushButton("Importar JSON...")
-        import_btn.setObjectName("secondaryAction")
-        import_btn.clicked.connect(self._import)
-        reset_btn = QPushButton("Restaurar predeterminados")
-        reset_btn.setObjectName("dangerAction")
-        reset_btn.clicked.connect(self._reset)
-        actions.addWidget(save_btn)
-        actions.addWidget(preview_btn)
-        actions.addWidget(export_btn)
-        actions.addWidget(import_btn)
-        actions.addStretch(1)
-        actions.addWidget(reset_btn)
-        layout.addLayout(actions)
+        root.addWidget(scroll, 1)
+
+        # ── Barra de acciones fija (no se desplaza) ─────────────────
+        action_bar = QFrame()
+        action_bar.setObjectName("actionBar")
+        actions = QHBoxLayout(action_bar)
+        actions.setContentsMargins(28, 12, 28, 12)
+        actions.setSpacing(10)
 
         self.feedback = QLabel("Listo.")
         self.feedback.setObjectName("muted")
-        layout.addWidget(self.feedback)
-        layout.addStretch(1)
+        actions.addWidget(self.feedback)
+        actions.addStretch(1)
+
+        reset_btn = QPushButton("Restaurar predeterminados")
+        reset_btn.setObjectName("dangerAction")
+        reset_btn.clicked.connect(self._reset)
+        import_btn = QPushButton("Importar JSON...")
+        import_btn.setObjectName("secondaryAction")
+        import_btn.clicked.connect(self._import)
+        export_btn = QPushButton("Exportar JSON...")
+        export_btn.setObjectName("secondaryAction")
+        export_btn.clicked.connect(self._export)
+        preview_btn = QPushButton("Previsualizar (sin guardar)")
+        preview_btn.setObjectName("secondaryAction")
+        preview_btn.clicked.connect(self._preview)
+        save_btn = QPushButton("Guardar y aplicar")
+        save_btn.setObjectName("primaryAction")
+        save_btn.clicked.connect(self._save_apply)
+        for btn in (reset_btn, import_btn, export_btn, preview_btn, save_btn):
+            actions.addWidget(btn)
+
+        root.addWidget(action_bar)
 
     def refresh(self):
         for key, input_field in self._empresa_inputs.items():
@@ -3604,6 +3888,1148 @@ class ConfiguracionPage(QWidget):
         self.feedback.setStyleSheet("")
 
 
+def _rt_money(value) -> str:
+    return f"${float(value or 0):,.0f}".replace(",", ".")
+
+
+# =============================================================================
+# Restaurante — tarjeta de mesa
+# =============================================================================
+class _RtTableCard(QFrame):
+    """Tarjeta clickable de una mesa en la grilla del salón."""
+
+    clicked = pyqtSignal(int)
+
+    def __init__(self, table: dict, selected: bool):
+        super().__init__()
+        self.table_id = int(table["id"])
+        self.setObjectName("rtTableCard")
+        self.setProperty("estado", table.get("estado") or "disponible")
+        self.setProperty("selected", "true" if selected else "false")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(190)
+        self.setMaximumWidth(260)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        name = QLabel(table.get("nombre") or table.get("codigo") or "Mesa")
+        name.setObjectName("rtCardName")
+        top.addWidget(name)
+        top.addStretch(1)
+        badge = QLabel(_RT_STATE_LABELS.get(table.get("estado"), table.get("estado") or ""))
+        badge.setObjectName("rtCardBadge")
+        top.addWidget(badge)
+        lay.addLayout(top)
+
+        meta = QLabel(f"{table.get('codigo') or ''} · {table.get('capacidad') or 0} pers.")
+        meta.setObjectName("rtCardMeta")
+        lay.addWidget(meta)
+
+        total = float(table.get("total_acumulado") or 0)
+        if table.get("order_local_id"):
+            total_label = QLabel(_rt_money(total))
+            total_label.setObjectName("rtCardTotal")
+            lay.addWidget(total_label)
+            sub = []
+            if table.get("comensales"):
+                sub.append(f"{table['comensales']} comensales")
+            pend = int(table.get("pendientes") or 0)
+            serv = int(table.get("servidos") or 0)
+            sub.append(f"{pend} pend · {serv} serv")
+            info = QLabel("  ·  ".join(sub))
+            info.setObjectName("rtCardMeta")
+            lay.addWidget(info)
+        else:
+            free = QLabel("Libre")
+            free.setObjectName("rtCardFree")
+            lay.addWidget(free)
+
+        if int(table.get("synced", 1)) == 0:
+            dot = QLabel("● pendiente de sync")
+            dot.setObjectName("rtCardPending")
+            lay.addWidget(dot)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit(self.table_id)
+        super().mousePressEvent(event)
+
+
+_RT_STATE_LABELS = {
+    "disponible": "Disponible",
+    "ocupada": "Ocupada",
+    "reservada": "Reservada",
+    "cuenta_solicitada": "Cuenta solicitada",
+}
+_RT_CONSUMPTION_LABELS = {
+    "pendiente": "Pendiente",
+    "preparando": "Preparando",
+    "servido": "Servido",
+}
+_RT_CONSUMPTION_NEXT = {"pendiente": "preparando", "preparando": "servido", "servido": "servido"}
+
+
+# =============================================================================
+# Restaurante — página principal (atención de mesas)
+# =============================================================================
+class RestaurantPage(QWidget):
+    """Atención de mesas offline-first. Espejo local de las tablas de
+    producción + outbox; toda acción funciona sin internet."""
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self._area = None
+        self._selected_table = None
+        self._view_mode = None  # "operativa" | "cajero" (default por rol en el 1er refresh)
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _role(self) -> str:
+        u = self._user()
+        return getattr(u, "role", "") if u else ""
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 18)
+        root.setSpacing(14)
+
+        # Encabezado
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel("Restaurante · Atención de mesas")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Cada tarjeta es una mesa del salón donde se sientan los clientes. "
+            "Toca una mesa para abrir su cuenta, anotar lo que piden y cobrar. "
+            "Funciona sin internet; los cambios se sincronizan al reconectar."
+        )
+        subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header.addLayout(title_col, 1)
+
+        controls = QVBoxLayout()
+        controls.setSpacing(6)
+        top_controls = QHBoxLayout()
+        top_controls.setSpacing(8)
+        area_lbl = QLabel("Área:")
+        area_lbl.setObjectName("fieldLabel")
+        top_controls.addWidget(area_lbl)
+        self.area_combo = QComboBox()
+        self.area_combo.setMinimumWidth(150)
+        self.area_combo.currentIndexChanged.connect(self._on_area_changed)
+        top_controls.addWidget(self.area_combo)
+        view_lbl = QLabel("Vista:")
+        view_lbl.setObjectName("fieldLabel")
+        top_controls.addWidget(view_lbl)
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Operativa (mesero)", "operativa")
+        self.view_combo.addItem("Resumen (cajero)", "cajero")
+        self.view_combo.currentIndexChanged.connect(self._on_view_changed)
+        top_controls.addWidget(self.view_combo)
+        refresh_btn = QPushButton("↻  Refrescar")
+        refresh_btn.setObjectName("secondaryAction")
+        refresh_btn.clicked.connect(self.refresh)
+        top_controls.addWidget(refresh_btn)
+        controls.addLayout(top_controls)
+        self.sync_label = QLabel("")
+        self.sync_label.setObjectName("rtSyncLabel")
+        self.sync_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        controls.addWidget(self.sync_label)
+        header.addLayout(controls)
+        root.addLayout(header)
+
+        # Leyenda de estados (qué significa cada color)
+        legend = QHBoxLayout()
+        legend.setSpacing(16)
+        leg_title = QLabel("Qué significa cada color:")
+        leg_title.setObjectName("muted")
+        legend.addWidget(leg_title)
+        for estado, label in _RT_STATE_LABELS.items():
+            chip = QLabel("● " + label)
+            chip.setObjectName("rtLegend")
+            chip.setProperty("estado", estado)
+            legend.addWidget(chip)
+        legend.addStretch(1)
+        root.addLayout(legend)
+
+        # Cuerpo: grilla de mesas (izq) + detalle de la mesa (der)
+        body = QHBoxLayout()
+        body.setSpacing(16)
+
+        grid_scroll = QScrollArea()
+        grid_scroll.setObjectName("configScroll")
+        grid_scroll.setWidgetResizable(True)
+        grid_host = QWidget()
+        self.grid = QGridLayout(grid_host)
+        self.grid.setContentsMargins(2, 2, 2, 2)
+        self.grid.setSpacing(12)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        grid_scroll.setWidget(grid_host)
+        body.addWidget(grid_scroll, 3)
+
+        # Panel de detalle con scroll (las cuentas largas no se cortan)
+        self.detail_panel = QFrame()
+        self.detail_panel.setObjectName("sectionPanel")
+        self.detail_panel.setMinimumWidth(380)
+        self.detail_panel.setMaximumWidth(460)
+        panel_outer = QVBoxLayout(self.detail_panel)
+        panel_outer.setContentsMargins(0, 0, 0, 0)
+        detail_scroll = QScrollArea()
+        detail_scroll.setObjectName("configScroll")
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        detail_host = QWidget()
+        self.detail_layout = QVBoxLayout(detail_host)
+        self.detail_layout.setContentsMargins(18, 16, 18, 16)
+        self.detail_layout.setSpacing(10)
+        detail_scroll.setWidget(detail_host)
+        panel_outer.addWidget(detail_scroll)
+        body.addWidget(self.detail_panel, 2)
+
+        root.addLayout(body, 1)
+        self.refresh()
+
+    # ─── Render ────────────────────────────────────────────────────
+    def refresh(self):
+        # Vista por defecto según rol (solo la primera vez)
+        if self._view_mode is None:
+            u = self._user()
+            self._view_mode = "cajero" if (u and getattr(u, "role", "") == "Cajero") else "operativa"
+            self.view_combo.blockSignals(True)
+            self.view_combo.setCurrentIndex(1 if self._view_mode == "cajero" else 0)
+            self.view_combo.blockSignals(False)
+
+        areas = self.store.rt_list_areas()
+        self.area_combo.blockSignals(True)
+        current = self.area_combo.currentText()
+        self.area_combo.clear()
+        if areas:
+            self.area_combo.addItem("Todas las áreas", None)
+            for a in areas:
+                self.area_combo.addItem(a, a)
+            idx = self.area_combo.findText(current) if current else 0
+            self.area_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.area_combo.blockSignals(False)
+        self._area = self.area_combo.currentData()
+
+        pend = self.store.rt_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync")
+            self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado")
+            self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label)
+        self.sync_label.style().polish(self.sync_label)
+
+        self._render_grid()
+        self._render_detail()
+
+    def _render_grid(self):
+        clear_layout(self.grid)
+        tables = self.store.rt_list_tables(self._area)
+        if not tables:
+            empty = QLabel("No hay mesas. Crea el plano desde la web (módulo Salón) y sincroniza.")
+            empty.setObjectName("muted")
+            empty.setWordWrap(True)
+            self.grid.addWidget(empty, 0, 0)
+            return
+        cols = 3
+        for i, t in enumerate(tables):
+            card = _RtTableCard(t, selected=(t["id"] == self._selected_table))
+            card.clicked.connect(self._select_table)
+            self.grid.addWidget(card, i // cols, i % cols)
+
+    def _select_table(self, table_id: int):
+        self._selected_table = int(table_id)
+        self._render_grid()
+        self._render_detail()
+
+    def _render_detail(self):
+        clear_layout(self.detail_layout)
+        if self._selected_table is None:
+            hint = QLabel("👈  Toca una mesa en el plano para ver o abrir su cuenta.")
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            self.detail_layout.addWidget(hint)
+            self.detail_layout.addStretch(1)
+            return
+        detail = self.store.rt_table_detail(self._selected_table)
+        if not detail:
+            self.detail_layout.addWidget(QLabel("Mesa no encontrada."))
+            self.detail_layout.addStretch(1)
+            return
+        table = detail["table"]
+        order = detail["order"]
+
+        # Encabezado: nombre de la mesa + pill de estado
+        head_row = QHBoxLayout()
+        head = QLabel(table.get("nombre") or table.get("codigo") or "Mesa")
+        head.setObjectName("rtDetailTitle")
+        head_row.addWidget(head)
+        head_row.addStretch(1)
+        pill = QLabel(_RT_STATE_LABELS.get(table.get("estado"), table.get("estado")))
+        pill.setObjectName("rtStatePill")
+        pill.setProperty("estado", table.get("estado"))
+        head_row.addWidget(pill)
+        self.detail_layout.addLayout(head_row)
+
+        meta = QLabel(f"Código {table.get('codigo') or '—'}  ·  Capacidad {table.get('capacidad') or 0} personas")
+        meta.setObjectName("rtCardMeta")
+        self.detail_layout.addWidget(meta)
+
+        if not order:
+            self._render_open_form()
+        else:
+            self._render_open_order(order)
+        self.detail_layout.addStretch(1)
+
+    def _render_open_form(self):
+        divider = QFrame(); divider.setObjectName("divider")
+        self.detail_layout.addWidget(divider)
+
+        sec = QLabel("ABRIR LA MESA")
+        sec.setObjectName("eyebrow")
+        self.detail_layout.addWidget(sec)
+        info = QLabel("Esta mesa está libre. Ingresa cuántas personas se sientan y ábrela para empezar a anotar lo que piden.")
+        info.setObjectName("muted"); info.setWordWrap(True)
+        self.detail_layout.addWidget(info)
+
+        form = QFormLayout(); form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.open_cliente = QLineEdit(); self.open_cliente.setPlaceholderText("Nombre del cliente (opcional)")
+        self.open_comensales = QSpinBox(); self.open_comensales.setRange(1, 50); self.open_comensales.setValue(2)
+        self.open_comensales.setSuffix(" personas")
+        cliente_lbl = QLabel("Cliente:"); cliente_lbl.setObjectName("fieldLabel")
+        com_lbl = QLabel("Comensales:"); com_lbl.setObjectName("fieldLabel")
+        form.addRow(cliente_lbl, self.open_cliente)
+        form.addRow(com_lbl, self.open_comensales)
+        self.detail_layout.addLayout(form)
+
+        open_btn = QPushButton("🍽  Abrir mesa")
+        open_btn.setObjectName("primaryAction")
+        open_btn.clicked.connect(self._open_table)
+        self.detail_layout.addWidget(open_btn)
+
+        divider2 = QFrame(); divider2.setObjectName("divider")
+        self.detail_layout.addWidget(divider2)
+        other = QLabel("¿No vas a atenderla aún?")
+        other.setObjectName("muted")
+        self.detail_layout.addWidget(other)
+        state_row = QHBoxLayout()
+        reserve_btn = QPushButton("Marcar reservada")
+        reserve_btn.setObjectName("secondaryAction")
+        reserve_btn.clicked.connect(lambda: self._set_table_state("reservada"))
+        free_btn = QPushButton("Marcar disponible")
+        free_btn.setObjectName("secondaryAction")
+        free_btn.clicked.connect(lambda: self._set_table_state("disponible"))
+        state_row.addWidget(reserve_btn); state_row.addWidget(free_btn)
+        self.detail_layout.addLayout(state_row)
+
+    def _render_open_order(self, order: dict):
+        divider = QFrame(); divider.setObjectName("divider")
+        self.detail_layout.addWidget(divider)
+
+        meta = []
+        if order.get("cliente_nombre"):
+            meta.append(f"👤 {order['cliente_nombre']}")
+        meta.append(f"{order.get('comensales') or 1} comensales")
+        meta_lbl = QLabel("   ·   ".join(meta))
+        meta_lbl.setObjectName("muted")
+        self.detail_layout.addWidget(meta_lbl)
+
+        detail = self.store.rt_table_detail(self._selected_table)
+        consumptions = detail["consumptions"]
+
+        # ── Barra de progreso de preparación (Pendiente → Preparando → Servido) ──
+        self.detail_layout.addWidget(self._progress_widget(consumptions))
+
+        # Vista cajero: resumen tipo recibo (sin controles de cocina ni alta de ítems)
+        if self._view_mode == "cajero":
+            self._render_cashier_summary(order, consumptions)
+            return
+
+        # ── Consumos (lo que ha pedido la mesa) — vista operativa ──
+        cons_title = QLabel("CONSUMOS DE LA MESA")
+        cons_title.setObjectName("eyebrow")
+        self.detail_layout.addWidget(cons_title)
+        if not consumptions:
+            empty = QLabel("Aún no se ha pedido nada. Agrega el primer consumo abajo.")
+            empty.setObjectName("muted"); empty.setWordWrap(True)
+            self.detail_layout.addWidget(empty)
+        else:
+            hint = QLabel("Toca el estado de cada ítem para avanzarlo: Pendiente → Preparando → Servido.")
+            hint.setObjectName("rtHint"); hint.setWordWrap(True)
+            self.detail_layout.addWidget(hint)
+            for c in consumptions:
+                self.detail_layout.addWidget(self._consumption_row(c))
+
+        total_lbl = QLabel(f"Total a cobrar:  {_rt_money(order.get('total_acumulado'))}")
+        total_lbl.setObjectName("rtDetailTotal")
+        self.detail_layout.addWidget(total_lbl)
+
+        # ── Agregar consumo ──
+        addbox = QFrame(); addbox.setObjectName("rtAddBox")
+        add_l = QVBoxLayout(addbox); add_l.setContentsMargins(14, 12, 14, 14); add_l.setSpacing(8)
+        add_title = QLabel("AGREGAR CONSUMO"); add_title.setObjectName("eyebrow")
+        add_l.addWidget(add_title)
+
+        self.prod_combo = QComboBox()
+        self.prod_combo.addItem("Producto del catálogo…", None)
+        self.prod_combo.addItem("✎  Escribir algo libre (sin catálogo)", "__free__")
+        for p in self.store.products():
+            if p.get("remote_id"):
+                self.prod_combo.addItem(f"{p['name']}  —  {_rt_money(p['price'])}", p["remote_id"])
+        self.prod_combo.currentIndexChanged.connect(self._on_prod_changed)
+        add_l.addWidget(self.prod_combo)
+
+        self.free_desc = QLineEdit(); self.free_desc.setPlaceholderText("¿Qué se pidió?")
+        add_l.addWidget(self.free_desc)
+        self.free_price_row = QWidget()
+        price_row = QHBoxLayout(self.free_price_row); price_row.setContentsMargins(0, 0, 0, 0); price_row.setSpacing(8)
+        price_lbl = QLabel("Precio:"); price_lbl.setObjectName("fieldLabel")
+        self.free_price = QDoubleSpinBox(); self.free_price.setRange(0, 100000000); self.free_price.setDecimals(0)
+        self.free_price.setPrefix("$ "); self.free_price.setGroupSeparatorShown(True)
+        price_row.addWidget(price_lbl); price_row.addWidget(self.free_price, 1)
+        add_l.addWidget(self.free_price_row)
+
+        qty_row = QHBoxLayout(); qty_row.setSpacing(8)
+        qty_lbl = QLabel("Cantidad:"); qty_lbl.setObjectName("fieldLabel")
+        self.qty_spin = QSpinBox(); self.qty_spin.setRange(1, 100); self.qty_spin.setValue(1)
+        qty_row.addWidget(qty_lbl); qty_row.addWidget(self.qty_spin); qty_row.addStretch(1)
+        add_l.addLayout(qty_row)
+        self.cons_notas = QLineEdit(); self.cons_notas.setPlaceholderText("Notas para cocina (opcional)")
+        add_l.addWidget(self.cons_notas)
+        add_btn = QPushButton("＋  Agregar a la cuenta")
+        add_btn.setObjectName("primaryAction")
+        add_btn.clicked.connect(self._add_consumption)
+        add_l.addWidget(add_btn)
+        self.detail_layout.addWidget(addbox)
+        self._on_prod_changed()  # estado inicial de campos libres
+
+        # ── Acciones de la cuenta ──
+        act_title = QLabel("ACCIONES"); act_title.setObjectName("eyebrow")
+        self.detail_layout.addWidget(act_title)
+        charge_btn = QPushButton(f"💳  Cobrar y cerrar  ·  {_rt_money(order.get('total_acumulado'))}")
+        charge_btn.setObjectName("primaryAction")
+        charge_btn.clicked.connect(self._close_table)
+        self.detail_layout.addWidget(charge_btn)
+
+        actions = QHBoxLayout()
+        bill_btn = QPushButton("Pedir la cuenta")
+        bill_btn.setObjectName("secondaryAction")
+        bill_btn.setToolTip("Marca la mesa como 'Cuenta solicitada' (el cliente pidió la cuenta).")
+        bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
+        actions.addWidget(bill_btn)
+        # Cancelar cuenta: solo Administrador/Cajero (espejo de RESTAURANT_CANCEL)
+        if self._role() in ("Administrador", "Cajero"):
+            cancel_btn = QPushButton("Cancelar cuenta")
+            cancel_btn.setObjectName("dangerAction")
+            cancel_btn.setToolTip("Anula la cuenta sin cobrar y libera la mesa.")
+            cancel_btn.clicked.connect(self._cancel_order)
+            actions.addWidget(cancel_btn)
+        self.detail_layout.addLayout(actions)
+
+    def _progress_widget(self, consumptions) -> QWidget:
+        """Barra segmentada del avance de preparación de la mesa."""
+        total = len(consumptions)
+        serv = sum(1 for c in consumptions if c["estado"] == "servido")
+        prep = sum(1 for c in consumptions if c["estado"] == "preparando")
+        pend = sum(1 for c in consumptions if c["estado"] == "pendiente")
+
+        box = QFrame(); box.setObjectName("rtProgressBox")
+        v = QVBoxLayout(box); v.setContentsMargins(12, 10, 12, 10); v.setSpacing(6)
+        head = QHBoxLayout()
+        t = QLabel("PREPARACIÓN DEL PEDIDO"); t.setObjectName("eyebrow")
+        head.addWidget(t); head.addStretch(1)
+        if total:
+            pct = QLabel(f"{round(100*serv/total)}%"); pct.setObjectName("rtProgPct")
+            head.addWidget(pct)
+        v.addLayout(head)
+
+        bar = QFrame(); bar.setObjectName("rtProgBar")
+        bl = QHBoxLayout(bar); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(0)
+        if total == 0:
+            empty_seg = QFrame(); empty_seg.setObjectName("rtProgSeg"); empty_seg.setProperty("estado", "vacio")
+            bl.addWidget(empty_seg, 1)
+        else:
+            for count, estado in ((serv, "servido"), (prep, "preparando"), (pend, "pendiente")):
+                if count:
+                    seg = QFrame(); seg.setObjectName("rtProgSeg"); seg.setProperty("estado", estado)
+                    bl.addWidget(seg, count)
+        v.addWidget(bar)
+
+        if total:
+            legend = QLabel(f"✓ {serv} servido(s)   ·   🍳 {prep} preparando   ·   ⏳ {pend} pendiente(s)")
+        else:
+            legend = QLabel("Sin ítems todavía.")
+        legend.setObjectName("rtProgLegend")
+        v.addWidget(legend)
+        return box
+
+    def _render_cashier_summary(self, order: dict, consumptions):
+        """Vista de cajero: recibo resumido + cobro. Sin controles de cocina."""
+        divider = QFrame(); divider.setObjectName("divider")
+        self.detail_layout.addWidget(divider)
+        sec = QLabel("RESUMEN DE LA CUENTA"); sec.setObjectName("eyebrow")
+        self.detail_layout.addWidget(sec)
+
+        # Recibo: agrupa ítems iguales (misma descripción + precio)
+        receipt = QFrame(); receipt.setObjectName("rtReceipt")
+        rl = QVBoxLayout(receipt); rl.setContentsMargins(14, 12, 14, 12); rl.setSpacing(6)
+        if not consumptions:
+            rl.addWidget(QLabel("Sin consumos."))
+        grouped = {}
+        order_keys = []
+        for c in consumptions:
+            key = (c["descripcion"], round(float(c["precio_unitario"]), 2))
+            if key not in grouped:
+                grouped[key] = {"cantidad": 0, "subtotal": 0.0, "estados": []}
+                order_keys.append(key)
+            grouped[key]["cantidad"] += int(c["cantidad"])
+            grouped[key]["subtotal"] += float(c["subtotal"])
+            grouped[key]["estados"].append(c["estado"])
+        for key in order_keys:
+            desc, _price = key
+            g = grouped[key]
+            line = QHBoxLayout(); line.setSpacing(8)
+            qty = QLabel(f"{g['cantidad']}×"); qty.setObjectName("rtRcptQty")
+            name = QLabel(desc); name.setObjectName("rtRcptName"); name.setWordWrap(True)
+            sub = QLabel(_rt_money(g["subtotal"])); sub.setObjectName("rtRcptSub")
+            line.addWidget(qty); line.addWidget(name, 1)
+            # chip de estado: si todos servidos -> listo; si hay pendientes -> en cocina
+            if all(e == "servido" for e in g["estados"]):
+                chip = QLabel("listo"); chip.setProperty("estado", "servido")
+            elif any(e == "pendiente" for e in g["estados"]):
+                chip = QLabel("en cocina"); chip.setProperty("estado", "pendiente")
+            else:
+                chip = QLabel("preparando"); chip.setProperty("estado", "preparando")
+            chip.setObjectName("rtRcptChip")
+            line.addWidget(chip)
+            line.addWidget(sub)
+            rl.addLayout(line)
+        self.detail_layout.addWidget(receipt)
+
+        total_lbl = QLabel(_rt_money(order.get("total_acumulado")))
+        total_lbl.setObjectName("rtCashierTotal")
+        cap = QLabel("TOTAL A COBRAR"); cap.setObjectName("eyebrow")
+        self.detail_layout.addWidget(cap)
+        self.detail_layout.addWidget(total_lbl)
+
+        charge_btn = QPushButton(f"💳  Cobrar y cerrar  ·  {_rt_money(order.get('total_acumulado'))}")
+        charge_btn.setObjectName("primaryAction")
+        charge_btn.clicked.connect(self._close_table)
+        self.detail_layout.addWidget(charge_btn)
+        bill_btn = QPushButton("Marcar 'cuenta solicitada'")
+        bill_btn.setObjectName("secondaryAction")
+        bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
+        self.detail_layout.addWidget(bill_btn)
+
+    def _consumption_row(self, c: dict) -> QWidget:
+        row = QFrame(); row.setObjectName("rtConsRow")
+        h = QHBoxLayout(row); h.setContentsMargins(10, 8, 10, 8); h.setSpacing(8)
+        left = QVBoxLayout(); left.setSpacing(1)
+        txt = QLabel(f"{c['cantidad']}×  {c['descripcion']}")
+        txt.setObjectName("rtConsText"); txt.setWordWrap(True)
+        left.addWidget(txt)
+        if c.get("notas"):
+            notas = QLabel(f"📝 {c['notas']}"); notas.setObjectName("rtConsNotas"); notas.setWordWrap(True)
+            left.addWidget(notas)
+        h.addLayout(left, 1)
+        sub = QLabel(_rt_money(c["subtotal"]))
+        sub.setObjectName("rtConsSub")
+        h.addWidget(sub)
+        state_btn = QPushButton(_RT_CONSUMPTION_LABELS.get(c["estado"], c["estado"]))
+        state_btn.setObjectName("rtStateBtn")
+        state_btn.setProperty("estado", c["estado"])
+        state_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if int(c.get("synced", 1)) == 0 and c.get("remote_id") is None:
+            state_btn.setEnabled(False)
+            state_btn.setToolTip("Disponible para avanzar una vez que sincronice.")
+        elif c["estado"] != "servido":
+            state_btn.clicked.connect(lambda _=False, cid=c["local_id"], st=c["estado"]: self._advance_consumption(cid, st))
+        else:
+            state_btn.setEnabled(False)
+        h.addWidget(state_btn)
+        return row
+
+    # ─── Acciones ──────────────────────────────────────────────────
+    def _on_area_changed(self):
+        self._area = self.area_combo.currentData()
+        self._render_grid()
+
+    def _on_view_changed(self):
+        self._view_mode = self.view_combo.currentData() or "operativa"
+        self._render_detail()
+
+    def _on_prod_changed(self):
+        """Muestra los campos libres solo cuando se eligió 'escribir algo libre'."""
+        is_free = self.prod_combo.currentData() == "__free__"
+        self.free_desc.setVisible(is_free)
+        self.free_price_row.setVisible(is_free)
+
+    def _open_table(self):
+        try:
+            self.store.rt_open_table(
+                self._selected_table, user=self._user(),
+                cliente=self.open_cliente.text(), comensales=self.open_comensales.value(),
+            )
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _add_consumption(self):
+        data = self.prod_combo.currentData()
+        if data is None:
+            self._error("Elige un producto del catálogo o la opción 'Escribir algo libre'.")
+            return
+        is_free = data == "__free__"
+        producto_id = None if is_free else data
+        try:
+            self.store.rt_add_consumption(
+                self._selected_table, user=self._user(),
+                producto_id=producto_id,
+                descripcion=self.free_desc.text() if is_free else "",
+                precio_unitario=self.free_price.value() if is_free else 0,
+                cantidad=self.qty_spin.value(),
+                notas=self.cons_notas.text(),
+            )
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _advance_consumption(self, consumption_local_id: int, current_state: str):
+        new_state = _RT_CONSUMPTION_NEXT.get(current_state, "servido")
+        try:
+            self.store.rt_set_consumption_state(consumption_local_id, new_state, user=self._user())
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _set_table_state(self, new_state: str):
+        try:
+            self.store.rt_set_table_state(self._selected_table, new_state, user=self._user())
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _close_table(self):
+        methods = ["EFECTIVO", "TARJETA", "TRANSFERENCIA", "MIXTO"]
+        method, ok = QInputDialog.getItem(self, "Cobrar y cerrar", "Método de pago:", methods, 0, False)
+        if not ok:
+            return
+        try:
+            self.store.rt_close_table(self._selected_table, payment_method=method, user=self._user())
+        except ValueError as exc:
+            self._error(str(exc)); return
+        QMessageBox.information(self, "Mesa cobrada", "Cuenta cerrada. Se registrará el ingreso al sincronizar.")
+        self._after_change()
+
+    def _cancel_order(self):
+        confirm = QMessageBox.question(self, "Cancelar cuenta",
+                                       "¿Cancelar la cuenta abierta de esta mesa? Esta acción no cobra.")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.rt_cancel_order(self._selected_table, user=self._user())
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+    def _error(self, msg: str):
+        QMessageBox.warning(self, "Restaurante", msg)
+
+
+_CB_TIPO_LABEL = {"ingreso": "Ingreso", "egreso": "Egreso"}
+
+
+def _cb_cat_label(cat: str) -> str:
+    return (cat or "").replace("_", " ").capitalize() if cat else "—"
+
+
+class MovimientoDialog(QDialog):
+    """Alta de un movimiento contable con preview de impuestos/retenciones."""
+
+    def __init__(self, parent, store: LocalStore, categorias):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("Nuevo movimiento")
+        self.setMinimumWidth(440)
+        self.result_data = None
+        form = QFormLayout(self)
+        form.setSpacing(10)
+
+        self.tipo = QComboBox(); self.tipo.addItem("Ingreso", "ingreso"); self.tipo.addItem("Egreso", "egreso")
+        self.tipo.currentIndexChanged.connect(self._on_tipo)
+        self.categoria = QComboBox(); self.categoria.setEditable(True)
+        for c in categorias:
+            self.categoria.addItem(_cb_cat_label(c), c)
+        self.descripcion = QLineEdit()
+        self.monto = QDoubleSpinBox(); self.monto.setRange(0, 1e12); self.monto.setDecimals(0)
+        self.monto.setPrefix("$ "); self.monto.setGroupSeparatorShown(True)
+        self.monto.valueChanged.connect(self._update_preview)
+        self.fecha = QDateEdit(QDate.currentDate()); self.fecha.setCalendarPopup(True); self.fecha.setDisplayFormat("yyyy-MM-dd")
+        self.notas = QLineEdit()
+
+        form.addRow("Tipo:", self.tipo)
+        form.addRow("Categoría:", self.categoria)
+        form.addRow("Descripción:", self.descripcion)
+        form.addRow("Monto bruto:", self.monto)
+        form.addRow("Fecha:", self.fecha)
+        form.addRow("Notas:", self.notas)
+
+        # Retenciones (solo ingreso)
+        self.ret_box = QFrame(); self.ret_box.setObjectName("rtAddBox")
+        rl = QFormLayout(self.ret_box); rl.setContentsMargins(12, 10, 12, 10); rl.setSpacing(6)
+        self.refuente = self._pct(); self.iva = self._pct(); self.reteiva = self._pct(); self.reteica = self._pct()
+        rl.addRow("ReteFuente %:", self.refuente)
+        rl.addRow("IVA %:", self.iva)
+        rl.addRow("ReteIVA % (sobre IVA):", self.reteiva)
+        rl.addRow("ReteICA %:", self.reteica)
+        form.addRow(self.ret_box)
+
+        self.preview = QLabel("Neto: $ 0"); self.preview.setObjectName("rtDetailTotal")
+        form.addRow(self.preview)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+        self._on_tipo()
+
+    def _pct(self):
+        s = QDoubleSpinBox(); s.setRange(0, 100); s.setDecimals(2); s.setSuffix(" %")
+        s.valueChanged.connect(self._update_preview)
+        return s
+
+    def _on_tipo(self):
+        is_ing = self.tipo.currentData() == "ingreso"
+        self.ret_box.setVisible(is_ing)
+        self._update_preview()
+
+    def _update_preview(self):
+        bruto = self.monto.value()
+        if self.tipo.currentData() == "ingreso":
+            calc = LocalStore.cb_calcular_impuestos(bruto, self.refuente.value(), self.iva.value(), self.reteiva.value(), self.reteica.value())
+            self.preview.setText(f"Retenciones: {_rt_money(calc['total_retenciones'])}   ·   Neto: {_rt_money(calc['monto_neto'])}")
+        else:
+            self.preview.setText(f"Neto: {_rt_money(bruto)}")
+
+    def _accept(self):
+        if not self.descripcion.text().strip():
+            QMessageBox.warning(self, "Contabilidad", "La descripción es obligatoria."); return
+        if self.monto.value() <= 0:
+            QMessageBox.warning(self, "Contabilidad", "El monto debe ser mayor a cero."); return
+        cat = self.categoria.currentData() or self.categoria.currentText().strip() or "otro"
+        self.result_data = {
+            "tipo": self.tipo.currentData(), "categoria": cat,
+            "descripcion": self.descripcion.text().strip(),
+            "monto_bruto": self.monto.value(), "fecha": self.fecha.date().toString("yyyy-MM-dd"),
+            "notas": self.notas.text().strip(),
+            "retefuente_pct": self.refuente.value(), "iva_pct": self.iva.value(),
+            "reteiva_pct": self.reteiva.value(), "reteica_pct": self.reteica.value(),
+        }
+        self.accept()
+
+
+class PlantillaDialog(QDialog):
+    def __init__(self, parent, categorias):
+        super().__init__(parent)
+        self.setWindowTitle("Nueva plantilla recurrente")
+        self.setMinimumWidth(400)
+        self.result_data = None
+        form = QFormLayout(self); form.setSpacing(10)
+        self.tipo = QComboBox(); self.tipo.addItem("Ingreso", "ingreso"); self.tipo.addItem("Egreso", "egreso")
+        self.categoria = QComboBox(); self.categoria.setEditable(True)
+        for c in categorias:
+            self.categoria.addItem(_cb_cat_label(c), c)
+        self.descripcion = QLineEdit()
+        self.monto = QDoubleSpinBox(); self.monto.setRange(0, 1e12); self.monto.setDecimals(0)
+        self.monto.setPrefix("$ "); self.monto.setGroupSeparatorShown(True)
+        self.notas = QLineEdit()
+        form.addRow("Tipo:", self.tipo); form.addRow("Categoría:", self.categoria)
+        form.addRow("Descripción:", self.descripcion); form.addRow("Monto:", self.monto)
+        form.addRow("Notas:", self.notas)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        if not self.descripcion.text().strip() or self.monto.value() <= 0:
+            QMessageBox.warning(self, "Contabilidad", "Descripción y monto (>0) son obligatorios."); return
+        self.result_data = {
+            "tipo": self.tipo.currentData(),
+            "categoria": self.categoria.currentData() or self.categoria.currentText().strip() or "otro",
+            "descripcion": self.descripcion.text().strip(), "monto_bruto": self.monto.value(),
+            "notas": self.notas.text().strip(),
+        }
+        self.accept()
+
+
+class CierreDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nuevo cierre de período")
+        self.setMinimumWidth(400)
+        self.result_data = None
+        form = QFormLayout(self); form.setSpacing(10)
+        self.nombre = QLineEdit(); self.nombre.setPlaceholderText("Ej. Cierre Junio 2026")
+        hoy = QDate.currentDate()
+        self.fi = QDateEdit(QDate(hoy.year(), hoy.month(), 1)); self.fi.setCalendarPopup(True); self.fi.setDisplayFormat("yyyy-MM-dd")
+        self.ff = QDateEdit(hoy); self.ff.setCalendarPopup(True); self.ff.setDisplayFormat("yyyy-MM-dd")
+        self.notas = QLineEdit()
+        form.addRow("Nombre:", self.nombre); form.addRow("Desde:", self.fi); form.addRow("Hasta:", self.ff)
+        form.addRow("Notas:", self.notas)
+        info = QLabel("Los totales (ingresos, egresos, retenciones, saldo) los calcula el servidor sobre todo el período.")
+        info.setObjectName("muted"); info.setWordWrap(True)
+        form.addRow(info)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        if not self.nombre.text().strip():
+            QMessageBox.warning(self, "Contabilidad", "El nombre es obligatorio."); return
+        self.result_data = {
+            "nombre": self.nombre.text().strip(),
+            "fecha_inicio": self.fi.date().toString("yyyy-MM-dd"),
+            "fecha_fin": self.ff.date().toString("yyyy-MM-dd"),
+            "notas": self.notas.text().strip(),
+        }
+        self.accept()
+
+
+# =============================================================================
+# Contabilidad — página principal (offline-first)
+# =============================================================================
+class ContabilidadPage(QWidget):
+    """Contabilidad offline-first: dashboard, movimientos, plantillas y cierres.
+    Espejo local + outbox; sincroniza con producción."""
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self._periodo = "mes"
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 18); root.setSpacing(12)
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("Contabilidad"); title.setObjectName("pageTitle")
+        sub = QLabel("Ingresos, egresos, retenciones y cierres. Funciona sin internet; sincroniza con producción.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.sync_label = QLabel(""); self.sync_label.setObjectName("rtSyncLabel")
+        header.addWidget(self.sync_label)
+        refresh = QPushButton("↻  Refrescar"); refresh.setObjectName("secondaryAction")
+        refresh.clicked.connect(self.refresh)
+        header.addWidget(refresh)
+        root.addLayout(header)
+
+        self.tabs = QTabWidget()
+        self.tab_dash = QWidget(); self.tab_mov = QWidget(); self.tab_pla = QWidget(); self.tab_cie = QWidget()
+        self.tabs.addTab(self.tab_dash, "Dashboard")
+        self.tabs.addTab(self.tab_mov, "Movimientos")
+        self.tabs.addTab(self.tab_pla, "Plantillas")
+        self.tabs.addTab(self.tab_cie, "Cierres")
+        QVBoxLayout(self.tab_dash); QVBoxLayout(self.tab_mov); QVBoxLayout(self.tab_pla); QVBoxLayout(self.tab_cie)
+        for t in (self.tab_dash, self.tab_mov, self.tab_pla, self.tab_cie):
+            t.layout().setContentsMargins(4, 12, 4, 4); t.layout().setSpacing(10)
+        root.addWidget(self.tabs, 1)
+        self.refresh()
+
+    # ─── Refresh ───────────────────────────────────────────────────
+    def refresh(self):
+        pend = self.store.cb_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync"); self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado"); self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label); self.sync_label.style().polish(self.sync_label)
+        self._render_dashboard(); self._render_movimientos(); self._render_plantillas(); self._render_cierres()
+
+    # ─── Dashboard ─────────────────────────────────────────────────
+    def _render_dashboard(self):
+        lay = self.tab_dash.layout(); clear_layout(lay)
+        bar = QHBoxLayout()
+        lbl = QLabel("Período:"); lbl.setObjectName("fieldLabel")
+        bar.addWidget(lbl)
+        self.periodo_combo = QComboBox()
+        for txt, val in [("Esta semana", "semana"), ("Este mes", "mes"), ("Mes anterior", "mes_ant"), ("Este año", "anio")]:
+            self.periodo_combo.addItem(txt, val)
+        idx = max(0, self.periodo_combo.findData(self._periodo))
+        self.periodo_combo.setCurrentIndex(idx)
+        self.periodo_combo.currentIndexChanged.connect(self._on_periodo)
+        bar.addWidget(self.periodo_combo); bar.addStretch(1)
+        lay.addLayout(bar)
+
+        d = self.store.cb_dashboard(self._periodo)
+        cards = QGridLayout(); cards.setSpacing(10)
+        cards.addWidget(metric_card("Ingresos netos", _rt_money(d["ingresos"])), 0, 0)
+        cards.addWidget(metric_card("Egresos", _rt_money(d["egresos"])), 0, 1)
+        cards.addWidget(metric_card("Saldo", _rt_money(d["saldo"])), 0, 2)
+        cards.addWidget(metric_card("Retenciones", _rt_money(d["retenciones"])), 0, 3)
+        lay.addLayout(cards)
+
+        # Desglose retenciones
+        det = QFrame(); det.setObjectName("sectionPanel")
+        dl = QVBoxLayout(det); dl.setContentsMargins(16, 12, 16, 12); dl.setSpacing(4)
+        dt = QLabel("DESGLOSE DE RETENCIONES E IVA"); dt.setObjectName("eyebrow"); dl.addWidget(dt)
+        dl.addWidget(QLabel(f"ReteFuente: {_rt_money(d['retefuente'])}   ·   IVA: {_rt_money(d['iva'])}   ·   "
+                            f"ReteIVA: {_rt_money(d['reteiva'])}   ·   ReteICA: {_rt_money(d['reteica'])}"))
+        dl.addWidget(QLabel(f"Ingresos: {d['num_ingresos']}   ·   Egresos: {d['num_egresos']}"))
+        lay.addWidget(det)
+
+        # Por categoría
+        cat_panel = QFrame(); cat_panel.setObjectName("sectionPanel")
+        cl = QVBoxLayout(cat_panel); cl.setContentsMargins(16, 12, 16, 12); cl.setSpacing(6)
+        cl.addWidget(self._eyebrow("POR CATEGORÍA"))
+        if not d["por_categoria"]:
+            cl.addWidget(self._muted("Sin movimientos en el período."))
+        for r in d["por_categoria"]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{_cb_cat_label(r['categoria'])}  ({_CB_TIPO_LABEL.get(r['tipo'], r['tipo'])})"), 1)
+            val = QLabel(_rt_money(r["total"])); val.setObjectName("rtConsSub"); row.addWidget(val)
+            cl.addLayout(row)
+        lay.addWidget(cat_panel)
+        lay.addStretch(1)
+
+    def _on_periodo(self):
+        self._periodo = self.periodo_combo.currentData() or "mes"
+        self._render_dashboard()
+
+    # ─── Movimientos ───────────────────────────────────────────────
+    def _render_movimientos(self):
+        lay = self.tab_mov.layout(); clear_layout(lay)
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self.f_tipo = QComboBox(); self.f_tipo.addItem("Todos", None); self.f_tipo.addItem("Ingresos", "ingreso"); self.f_tipo.addItem("Egresos", "egreso")
+        self.f_cat = QComboBox(); self.f_cat.addItem("Todas las categorías", None)
+        for c in self.store.cb_categorias():
+            self.f_cat.addItem(_cb_cat_label(c), c)
+        self.f_tipo.currentIndexChanged.connect(self._render_mov_table)
+        self.f_cat.currentIndexChanged.connect(self._render_mov_table)
+        bar.addWidget(QLabel("Filtro:")); bar.addWidget(self.f_tipo); bar.addWidget(self.f_cat); bar.addStretch(1)
+        nuevo = QPushButton("＋  Nuevo movimiento"); nuevo.setObjectName("primaryAction"); nuevo.clicked.connect(self._nuevo_movimiento)
+        export = QPushButton("Exportar CSV"); export.setObjectName("secondaryAction"); export.clicked.connect(self._export_csv)
+        bar.addWidget(export); bar.addWidget(nuevo)
+        lay.addLayout(bar)
+
+        self.mov_table = QTableWidget(0, 6)
+        self.mov_table.setHorizontalHeaderLabels(["Fecha", "Tipo", "Categoría", "Descripción", "Neto", ""])
+        self.mov_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.mov_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.mov_table.verticalHeader().setVisible(False)
+        lay.addWidget(self.mov_table, 1)
+        self._render_mov_table()
+
+    def _render_mov_table(self):
+        tipo = self.f_tipo.currentData(); cat = self.f_cat.currentData()
+        rows = self.store.cb_list_movimientos(tipo=tipo, categoria=cat)
+        self.mov_table.setRowCount(len(rows))
+        for i, m in enumerate(rows):
+            self.mov_table.setItem(i, 0, QTableWidgetItem(m["fecha"] or ""))
+            self.mov_table.setItem(i, 1, QTableWidgetItem(_CB_TIPO_LABEL.get(m["tipo"], m["tipo"])))
+            self.mov_table.setItem(i, 2, QTableWidgetItem(_cb_cat_label(m["categoria"])))
+            desc = m["descripcion"] + ("  ⏳" if m["synced"] == 0 else "")
+            self.mov_table.setItem(i, 3, QTableWidgetItem(desc))
+            monto = QTableWidgetItem(("− " if m["tipo"] == "egreso" else "") + _rt_money(m["monto"]))
+            self.mov_table.setItem(i, 4, monto)
+            if m["auto_generado"]:
+                tag = QTableWidgetItem("auto"); tag.setToolTip("Automático (venta) — no se puede eliminar")
+                self.mov_table.setItem(i, 5, tag)
+            else:
+                btn = QPushButton("Eliminar"); btn.setObjectName("inlineDanger")
+                btn.clicked.connect(lambda _=False, lid=m["local_id"]: self._eliminar_movimiento(lid))
+                self.mov_table.setCellWidget(i, 5, btn)
+
+    def _nuevo_movimiento(self):
+        dlg = MovimientoDialog(self, self.store, self.store.cb_categorias())
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.cb_crear_movimiento(
+                d["tipo"], d["categoria"], d["descripcion"], d["monto_bruto"], fecha=d["fecha"], notas=d["notas"],
+                retefuente_pct=d["retefuente_pct"], iva_pct=d["iva_pct"], reteiva_pct=d["reteiva_pct"],
+                reteica_pct=d["reteica_pct"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    def _eliminar_movimiento(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar este movimiento?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.cb_eliminar_movimiento(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    def _export_csv(self):
+        rows = self.store.cb_list_movimientos(tipo=self.f_tipo.currentData(), categoria=self.f_cat.currentData(), limit=100000)
+        path, _ = QFileDialog.getSaveFileName(self, "Exportar movimientos", "contabilidad.csv", "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["Fecha", "Tipo", "Categoria", "Descripcion", "Monto bruto", "Retenciones", "Neto", "Notas"])
+                for m in rows:
+                    w.writerow([m["fecha"], m["tipo"], m["categoria"], m["descripcion"],
+                                m["monto_bruto"], m["total_retenciones"], m["monto"], m.get("notas") or ""])
+            QMessageBox.information(self, "Exportar", f"Exportado: {path}")
+        except OSError as exc:
+            QMessageBox.warning(self, "Exportar", f"No se pudo guardar: {exc}")
+
+    # ─── Plantillas ────────────────────────────────────────────────
+    def _render_plantillas(self):
+        lay = self.tab_pla.layout(); clear_layout(lay)
+        bar = QHBoxLayout()
+        info = QLabel("Movimientos recurrentes. 'Generar' crea los del mes actual (sin duplicar).")
+        info.setObjectName("muted"); info.setWordWrap(True)
+        bar.addWidget(info, 1)
+        gen = QPushButton("Generar movimientos del mes"); gen.setObjectName("secondaryAction"); gen.clicked.connect(self._generar)
+        nueva = QPushButton("＋  Nueva plantilla"); nueva.setObjectName("primaryAction"); nueva.clicked.connect(self._nueva_plantilla)
+        bar.addWidget(gen); bar.addWidget(nueva)
+        lay.addLayout(bar)
+        self.pla_table = QTableWidget(0, 6)
+        self.pla_table.setHorizontalHeaderLabels(["Tipo", "Categoría", "Descripción", "Monto", "Activa", ""])
+        self.pla_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.pla_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pla_table.verticalHeader().setVisible(False)
+        lay.addWidget(self.pla_table, 1)
+        rows = self.store.cb_list_plantillas()
+        self.pla_table.setRowCount(len(rows))
+        for i, p in enumerate(rows):
+            self.pla_table.setItem(i, 0, QTableWidgetItem(_CB_TIPO_LABEL.get(p["tipo"], p["tipo"])))
+            self.pla_table.setItem(i, 1, QTableWidgetItem(_cb_cat_label(p["categoria"])))
+            self.pla_table.setItem(i, 2, QTableWidgetItem(p["descripcion"]))
+            self.pla_table.setItem(i, 3, QTableWidgetItem(_rt_money(p["monto_bruto"])))
+            tg = QPushButton("Sí" if p["activo"] else "No"); tg.setObjectName("secondaryAction")
+            tg.clicked.connect(lambda _=False, lid=p["local_id"]: self._toggle_plantilla(lid))
+            self.pla_table.setCellWidget(i, 4, tg)
+            dl = QPushButton("Eliminar"); dl.setObjectName("inlineDanger")
+            dl.clicked.connect(lambda _=False, lid=p["local_id"]: self._eliminar_plantilla(lid))
+            self.pla_table.setCellWidget(i, 5, dl)
+
+    def _nueva_plantilla(self):
+        dlg = PlantillaDialog(self, self.store.cb_categorias())
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.cb_crear_plantilla(d["tipo"], d["categoria"], d["descripcion"], d["monto_bruto"], notas=d["notas"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    def _toggle_plantilla(self, local_id):
+        try:
+            self.store.cb_toggle_plantilla(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    def _eliminar_plantilla(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar esta plantilla?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.cb_eliminar_plantilla(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    def _generar(self):
+        self.store.cb_generar_plantillas(user=self._user())
+        QMessageBox.information(self, "Plantillas", "Generación encolada. Los movimientos del mes aparecerán al sincronizar.")
+        self._after_change()
+
+    # ─── Cierres ───────────────────────────────────────────────────
+    def _render_cierres(self):
+        lay = self.tab_cie.layout(); clear_layout(lay)
+        bar = QHBoxLayout()
+        info = QLabel("Resumen de un período (ingresos, egresos, retenciones, saldo).")
+        info.setObjectName("muted"); bar.addWidget(info, 1)
+        nuevo = QPushButton("＋  Nuevo cierre"); nuevo.setObjectName("primaryAction"); nuevo.clicked.connect(self._nuevo_cierre)
+        bar.addWidget(nuevo)
+        lay.addLayout(bar)
+        self.cie_table = QTableWidget(0, 7)
+        self.cie_table.setHorizontalHeaderLabels(["Nombre", "Desde", "Hasta", "Ingresos", "Egresos", "Saldo", ""])
+        self.cie_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.cie_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cie_table.verticalHeader().setVisible(False)
+        lay.addWidget(self.cie_table, 1)
+        rows = self.store.cb_list_cierres()
+        self.cie_table.setRowCount(len(rows))
+        for i, c in enumerate(rows):
+            nombre = c["nombre"] + ("  ⏳" if c["synced"] == 0 else "")
+            self.cie_table.setItem(i, 0, QTableWidgetItem(nombre))
+            self.cie_table.setItem(i, 1, QTableWidgetItem(c["fecha_inicio"] or ""))
+            self.cie_table.setItem(i, 2, QTableWidgetItem(c["fecha_fin"] or ""))
+            self.cie_table.setItem(i, 3, QTableWidgetItem(_rt_money(c["total_ingresos"])))
+            self.cie_table.setItem(i, 4, QTableWidgetItem(_rt_money(c["total_egresos"])))
+            self.cie_table.setItem(i, 5, QTableWidgetItem(_rt_money(c["saldo"])))
+            dl = QPushButton("Eliminar"); dl.setObjectName("inlineDanger")
+            dl.clicked.connect(lambda _=False, lid=c["local_id"]: self._eliminar_cierre(lid))
+            self.cie_table.setCellWidget(i, 6, dl)
+
+    def _nuevo_cierre(self):
+        dlg = CierreDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.cb_crear_cierre(d["nombre"], d["fecha_inicio"], d["fecha_fin"], notas=d["notas"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        QMessageBox.information(self, "Cierre", "Cierre encolado. Los totales los calcula el servidor al sincronizar.")
+        self._after_change()
+
+    def _eliminar_cierre(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar este cierre?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.cb_eliminar_cierre(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Contabilidad", str(exc)); return
+        self._after_change()
+
+    # ─── Helpers ───────────────────────────────────────────────────
+    def _eyebrow(self, text):
+        l = QLabel(text); l.setObjectName("eyebrow"); return l
+
+    def _muted(self, text):
+        l = QLabel(text); l.setObjectName("muted"); l.setWordWrap(True); return l
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
 # =============================================================================
 # Shell
 # =============================================================================
@@ -3612,9 +5038,11 @@ class DesktopShell(QMainWindow):
     NAV_ITEMS = [
         ("dashboard", "▦", "Dashboard",       "F1", "Operación"),
         ("pos",       "⌧", "POS",             "F3", "Operación"),
+        ("restaurant","▤", "Restaurante",     "F9", "Operación"),
         ("sales",     "$", "Ventas",          "F5", "Operación"),
         ("products",  "▤", "Productos",       "F2", "Datos"),
         ("inventory", "⊞", "Inventario",      "F4", "Datos"),
+        ("contabilidad", "Σ", "Contabilidad", "F10", "Datos"),
         ("users",     "◯", "Usuarios",        "F6", "Datos"),
         ("sync",      "⟳", "Sincronización",  "F7", "Sistema"),
         ("config",    "✎", "Configuración",   "F8", "Sistema"),
@@ -3717,13 +5145,17 @@ class DesktopShell(QMainWindow):
 
         # Nav items agrupados por sección
         self.nav_buttons = {}
+        self.nav_section_labels = {}   # section -> QLabel (para ocultar si queda vacía)
+        self.nav_sections = {}         # section -> [keys] (para saber si quedó vacía)
         last_section = None
         for key, icon, label, shortcut, section in self.NAV_ITEMS:
             if section != last_section:
                 section_label = QLabel(section)
                 section_label.setObjectName("sidebarSection")
                 side_layout.addWidget(section_label)
+                self.nav_section_labels[section] = section_label
                 last_section = section
+            self.nav_sections.setdefault(section, []).append(key)
             button = QPushButton(f"  {icon}    {label}")
             button.setObjectName("navButton")
             button.setToolTip(f"{label} ({shortcut})")
@@ -3742,6 +5174,8 @@ class DesktopShell(QMainWindow):
             "dashboard": DashboardPage(self.store, self._show_section),
             "products": ProductsPage(self.store, self._refresh_shared_pages),
             "pos": PosPage(self.store, self._refresh_shared_pages, scanner=self.scanner, brand_callback=self._get_branding),
+            "restaurant": RestaurantPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
+            "contabilidad": ContabilidadPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
             "inventory": InventoryPage(self.store, self._refresh_shared_pages),
             "sales": SalesPage(self.store, brand_callback=self._get_branding),
             "users": UsersPage(self.store, self._refresh_shared_pages),
@@ -3787,8 +5221,12 @@ class DesktopShell(QMainWindow):
         self.user_avatar_label.setText(initial)
         info = self.store.db_info()
         self.footer_right.setText(info["path"])
+        self._apply_role_visibility(role)
         self.stack.setCurrentWidget(self.app_view)
-        self._show_section("dashboard")
+        # Aterriza en el primer módulo permitido (dashboard si está disponible)
+        landing = "dashboard" if "dashboard" in self._allowed_sections else next(iter(self._allowed_sections), None)
+        if landing:
+            self._show_section(landing)
         # Kickoff diferido (no bloqueante a la UI): branding sync + update check.
         # Se ejecuta una sola vez por sesión. Si falla por red, silencioso.
         QTimer.singleShot(500, self._pull_branding_from_server)
@@ -3811,10 +5249,26 @@ class DesktopShell(QMainWindow):
         self.scanner.set_enabled(False)
         self.stack.setCurrentWidget(self.login_view)
 
+    def _apply_role_visibility(self, role: str):
+        """Muestra solo los módulos permitidos para el rol (espejo de security.py).
+        Oculta botones de nav y etiquetas de sección que queden vacías."""
+        allowed = modules_for_role(role)
+        self._allowed_sections = allowed
+        for key, button in self.nav_buttons.items():
+            button.setVisible(key in allowed)
+        # Oculta el rótulo de una sección si ninguno de sus botones quedó visible
+        for section, keys in self.nav_sections.items():
+            label = self.nav_section_labels.get(section)
+            if label is not None:
+                label.setVisible(any(k in allowed for k in keys))
+
     def _show_section(self, name):
         if self.stack.currentWidget() is not self.app_view:
             return
         if name not in self.pages:
+            return
+        # Control de acceso por rol: ignora navegación a módulos no permitidos
+        if name not in getattr(self, "_allowed_sections", set()):
             return
         self._refresh_page(name)
         self.content_stack.setCurrentWidget(self.pages[name])
@@ -3830,7 +5284,7 @@ class DesktopShell(QMainWindow):
             QTimer.singleShot(80, self.pages["pos"].focus_barcode)
 
     def _refresh_shared_pages(self):
-        for name in ("dashboard", "products", "pos", "inventory", "sales", "users", "sync"):
+        for name in ("dashboard", "products", "pos", "restaurant", "contabilidad", "inventory", "sales", "users", "sync"):
             self._refresh_page(name)
 
     def _refresh_page(self, name):
@@ -4052,6 +5506,11 @@ def clear_layout(layout):
         widget = item.widget()
         if widget:
             widget.deleteLater()
+        else:
+            child = item.layout()
+            if child is not None:
+                clear_layout(child)
+                child.deleteLater()
 
 
 def main():

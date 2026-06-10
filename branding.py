@@ -10,7 +10,7 @@ Las claves estan agrupadas en:
 - empresa: nombre, slogan, email, telefono, direccion, website, logo_path,
            recibo_pie, ventana_titulo
 - colores: primario, primario_oscuro, acento, acento_secundario, peligro,
-           sidebar_inicio, sidebar_fin, fondo
+           sidebar_inicio, sidebar_fin, fondo, superficie
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "sidebar_inicio": "#091C5A",
         "sidebar_fin": "#122C94",
         "fondo": "#f8faff",
+        "superficie": "#ffffff",
     },
 }
 
@@ -56,6 +57,7 @@ REQUIRED_COLOR_KEYS = {
     "sidebar_inicio",
     "sidebar_fin",
     "fondo",
+    "superficie",
 }
 
 

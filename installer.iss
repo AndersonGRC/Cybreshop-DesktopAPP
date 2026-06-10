@@ -42,7 +42,7 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crear acceso directo en el escritorio"; \
-      GroupDescription: "Accesos:"; Flags: unchecked
+      GroupDescription: "Accesos:"
 
 [Files]
 ; Output completo de PyInstaller (build_exe.bat genera dist\CyberShopOffline\)
@@ -65,40 +65,36 @@ var
   ServerPage: TInputQueryWizardPage;
   PgPage:     TInputQueryWizardPage;
 
-{ ────────────────────────────────────────────────────────────
+(* ────────────────────────────────────────────────────────────
   Helpers para parsear bootstrap.json (parser muy simple, no
   requiere unidades externas). Asume el formato exacto que
   produce installer_packager.py:
-    {
-      "server_url": "...",
-      "api_key": "...",
-      "tenant_slug": "...",
-      ...
-    }
-  ──────────────────────────────────────────────────────────── }
+    server_url, api_key, tenant_slug — strings JSON simples.
+  ──────────────────────────────────────────────────────────── *)
 
-function ExtractJsonString(const Json, Key: String): String;
+function ExtractJsonString(const Json: AnsiString; const Key: String): String;
 var
-  Pat: String;
+  Pat: AnsiString;
   P, EndQuote: Integer;
 begin
   Result := '';
-  Pat := '"' + Key + '"';
+  Pat := AnsiString('"' + Key + '"');
   P := Pos(Pat, Json);
   if P = 0 then Exit;
   P := P + Length(Pat);
   while (P <= Length(Json)) and (Json[P] <> '"') do Inc(P);
   if P > Length(Json) then Exit;
-  Inc(P);  { saltar la comilla de apertura del valor }
+  Inc(P);  (* saltar la comilla de apertura del valor *)
   EndQuote := P;
   while (EndQuote <= Length(Json)) and (Json[EndQuote] <> '"') do Inc(EndQuote);
   if EndQuote > Length(Json) then Exit;
-  Result := Copy(Json, P, EndQuote - P);
+  Result := String(Copy(Json, P, EndQuote - P));
 end;
 
 procedure PreloadFromBootstrap();
 var
-  BootstrapPath, Json: String;
+  BootstrapPath: String;
+  Json: AnsiString;
   ServerUrl, ApiKey, TenantSlug: String;
 begin
   BootstrapPath := ExpandConstant('{src}\bootstrap.json');
