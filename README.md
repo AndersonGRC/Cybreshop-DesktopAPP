@@ -70,7 +70,7 @@ Para reiniciar datos: cerrar la app y borrar el archivo correspondiente.
 ### Esquema de la base SQLite (`cybershop_offline.db`)
 
 Definido en `local_store.py::_init_schema()` (migraciones idempotentes con
-`_ensure_column`). 10 tablas:
+`_ensure_column`). 16 tablas:
 
 | Tabla | Propósito |
 |---|---|
@@ -84,6 +84,8 @@ Definido en `local_store.py::_init_schema()` (migraciones idempotentes con
 | `metadata` | Clave-valor (flags como `seed_done`) |
 | `remote_sales_cache` | Caché de ventas web (`/sync/sales_web`) — solo lectura para mostrar |
 | `remote_inventory_cache` | Caché de inventario web (`/sync/inventory_log`) — solo lectura |
+| `rt_tables` / `rt_orders` / `rt_consumptions` | Espejo local del módulo Restaurante (mesas, cuentas abiertas, consumos). Flag `synced`: 0 = cambio local pendiente (el pull lo preserva), 1 = verdad del servidor |
+| `cb_movimientos` / `cb_plantillas` / `cb_cierres` | Espejo local de Contabilidad (movimientos con impuestos, plantillas recurrentes, cierres de período). Mismo patrón `synced` |
 
 Borrados son **soft delete** (`active=0`) para preservar historial de sync.
 
@@ -286,12 +288,35 @@ en `%APPDATA%\CyberShopNative\.cybershop.conf`.
 | F6    | Usuarios       | CRUD local con roles y cambio de contrasena       |
 | F7    | Sincronizacion | Estado de la BD y outbox local                    |
 | F8    | Configuracion  | Branding (colores, logo, datos de empresa)        |
+| F9    | Restaurante    | Atencion de mesas offline-first: abrir mesa, consumos con avance pendiente→preparando→servido, vista cajero resumida, cobrar/cerrar (crea movimiento contable en el servidor) |
+| F10   | Contabilidad   | Dashboard, movimientos (con impuestos retefuente/IVA/reteIVA/reteICA), plantillas recurrentes, cierres de período y export CSV |
+
+> La visibilidad de cada módulo depende del **rol** del usuario (ver "Roles y permisos").
+
+## Roles y permisos (RBAC)
+
+El escritorio replica los roles de la web (tabla `roles` del tenant). Al hacer
+login (remoto o offline), `map_role(rol_id)` resuelve el rol y `ROLE_MODULES`
+define qué módulos ve cada uno (`main.py`):
+
+| Rol (web → escritorio) | Módulos visibles |
+|---|---|
+| 1 admin / 2 propietario → **Administrador** | Todos (F1–F10) |
+| 4 → **Empleado** | Dashboard, POS, Restaurante, Ventas, Productos, Inventario |
+| 7 → **Cajero** | Dashboard, POS, Restaurante, Ventas (vista cajero resumida en Restaurante; puede cancelar pedidos) |
+| 6 → **Mesero** | Dashboard, POS, Restaurante (no puede cancelar pedidos) |
+| 5 → **Contador** | Dashboard, Ventas, Contabilidad |
+| 3 → **Cliente** | Solo Dashboard (no debería usar el escritorio) |
+
+La navegación oculta los módulos no permitidos y `_show_section` bloquea el
+acceso directo. Espejo de los grupos de `security.py` de la web
+(`ADMIN_FULL`, `POS_OPERATIONAL`, `RESTAURANT_*`, `ADMIN_CONTADOR`).
 
 ## Mapa de archivos
 
 | Archivo | Para qué sirve |
 |---|---|
-| `main.py` (~4075 líneas) | App PyQt6. Clases clave: `DesktopShell` (ventana + sidebar + atajos F1–F8), `LoginView`/`ChangePasswordDialog` (auth), `ScannerEngine` (lector de barras, <50 ms), y una vista por módulo: `DashboardPage`, `ProductsPage`, `PosPage`, `InventoryPage`, `SalesPage`, `UsersPage`, `SyncPage`, `ConfiguracionPage` |
+| `main.py` (~5700 líneas) | App PyQt6. Clases clave: `DesktopShell` (ventana + sidebar + atajos F1–F8), `LoginView`/`ChangePasswordDialog` (auth), `ScannerEngine` (lector de barras, <50 ms), y una vista por módulo: `DashboardPage`, `ProductsPage`, `PosPage`, `InventoryPage`, `SalesPage`, `UsersPage`, `SyncPage`, `ConfiguracionPage`, `RestaurantPage` (F9), `ContabilidadPage` (F10); RBAC vía `map_role` + `ROLE_MODULES` |
 | `local_store.py` | Capa SQLite: esquema, CRUD productos/usuarios/ventas, hashing PBKDF2, outbox, cachés remotas, `cache_remote_login`, `upsert_*_from_remote` |
 | `sync_client.py` | Cliente HTTP de `/api/v1/sync/*` (solo `urllib`, sin dependencias) |
 | `sync_config.py` | Estado de sync persistente (`sync_config.json`: base_url, api_key, cursores, last_sync) |
