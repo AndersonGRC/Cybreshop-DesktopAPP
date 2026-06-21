@@ -28,6 +28,10 @@ _dbg_*.log
 *.log
 .gittmp/
 
+# Previews / capturas de desarrollo (regenerables, no versionar)
+_preview_*
+_screenshot_window.png
+
 # IDE
 .vscode/
 .idea/

@@ -14,7 +14,7 @@
 ; ===============================================================
 
 #define AppName       "CyberShop POS"
-#define AppVersion    "1.0.0"
+#define AppVersion    "1.0.0.2"
 #define AppPublisher  "CyberShop"
 #define AppExeName    "CyberShopOffline.exe"
 

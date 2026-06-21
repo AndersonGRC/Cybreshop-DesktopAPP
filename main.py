@@ -3,8 +3,21 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QKeyEvent, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QDate, QEvent, QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QFont,
+    QIcon,
+    QKeyEvent,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,7 +60,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.0.2"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
@@ -65,9 +78,40 @@ ROLE_MODULES = {
 }
 DEFAULT_ROLE_MODULES = {"dashboard", "pos"}  # fallback prudente para roles desconocidos
 
+# Gating por PLAN del tenant: config_key de cliente_config (web) -> nav key del
+# desktop. El maestro (CyberShopAdmin) activa/desactiva estos flags por plan; el
+# desktop los pulea en /api/v1/sync/config y oculta los módulos fuera del plan.
+# 'sales' (historial de recibos POS) pertenece al POS, por eso comparte
+# pos_habilitado y NO el módulo web 'orders'/'pedidos'.
+TENANT_MODULE_MAP = {
+    "pos":          "pos_habilitado",
+    "sales":        "pos_habilitado",
+    "restaurant":   "restaurant_tables_habilitado",
+    "products":     "inventario_habilitado",
+    "inventory":    "inventario_habilitado",
+    "contabilidad": "contabilidad_habilitada",
+    "users":        "usuarios_habilitado",
+}
+# Módulos de sistema: nunca dependen del plan (el usuario debe poder
+# sincronizar/configurar para des-restringirse a sí mismo).
+SYSTEM_MODULES = {"dashboard", "sync", "config"}
+
 
 def modules_for_role(role: str) -> set:
     return ROLE_MODULES.get((role or "").strip(), DEFAULT_ROLE_MODULES)
+
+
+def tenant_allowed_modules(cached_flags) -> set | None:
+    """Set de nav keys permitidas por el PLAN del tenant. None si no hay flags
+    cacheados todavía (=> sin restricción, fail-open)."""
+    if not cached_flags:                       # None o {} -> sin restricción
+        return None
+    allowed = set(SYSTEM_MODULES)
+    for nav_key, config_key in TENANT_MODULE_MAP.items():
+        val = cached_flags.get(config_key)
+        if val is None or bool(val):           # clave ausente => permitido (fail-open por clave)
+            allowed.add(nav_key)
+    return allowed
 
 
 def _asset_path(name: str) -> Path:
@@ -625,13 +669,13 @@ QTableWidget {
     selection-background-color: rgba($primario_rgb, 0.18);
     selection-color: $primario_oscuro;
 }
-QTableWidget::item { padding: 8px 6px; }
+QTableWidget::item { padding: 13px 12px; }
 QHeaderView::section {
     background: rgba($primario_rgb, 0.08);
     color: #374151;
     border: 0;
     border-bottom: 1px solid rgba($primario_rgb, 0.20);
-    padding: 10px 8px;
+    padding: 13px 12px;
     font-weight: 750;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -767,6 +811,11 @@ QScrollArea#configScroll {
     background: transparent;
 }
 QScrollArea#configScroll > QWidget > QWidget { background: transparent; }
+QScrollArea#dashboardScroll {
+    border: 0;
+    background: transparent;
+}
+QScrollArea#dashboardScroll > QWidget > QWidget { background: transparent; }
 QLabel#sectionTitle {
     color: $primario_oscuro;
     font-size: 16px;
@@ -1452,9 +1501,25 @@ class DashboardPage(QWidget):
         self._build()
 
     def _build(self):
-        body = QVBoxLayout(self)
-        body.setContentsMargins(24, 22, 24, 22)
-        body.setSpacing(14)
+        # Layout raíz: solo el área desplazable, para que el dashboard tenga aire
+        # y se pueda hacer scroll en vez de quedar todo amontonado en una pantalla.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("dashboardScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        root.addWidget(scroll)
+
+        content = QWidget()
+        content.setObjectName("dashboardContent")
+        scroll.setWidget(content)
+
+        body = QVBoxLayout(content)
+        body.setContentsMargins(30, 26, 30, 30)
+        body.setSpacing(20)
 
         header = QLabel("Menú administrativo")
         header.setObjectName("pageTitle")
@@ -1462,17 +1527,26 @@ class DashboardPage(QWidget):
         subtitle.setObjectName("muted")
         body.addWidget(header)
         body.addWidget(subtitle)
-        body.addSpacing(2)
+        body.addSpacing(6)
         body.addWidget(self._hero_panel())
 
+        body.addSpacing(8)
         local_eyebrow = QLabel("TU NEGOCIO  ·  LOCAL")
         local_eyebrow.setObjectName("eyebrow")
         body.addWidget(local_eyebrow)
         self.metrics_grid = QGridLayout()
-        self.metrics_grid.setSpacing(10)
+        self.metrics_grid.setSpacing(16)
         body.addLayout(self.metrics_grid)
 
+        # Mini-gráficos locales (tendencia, top productos, salud de stock)
+        body.addSpacing(8)
+        self.charts_row = QHBoxLayout()
+        self.charts_row.setSpacing(16)
+        body.addLayout(self.charts_row)
+
+        body.addSpacing(8)
         body.addWidget(self._vps_metrics_panel())
+        body.addSpacing(8)
         body.addWidget(self._module_grid())
         body.addStretch(1)
         self.refresh()
@@ -1502,19 +1576,21 @@ class DashboardPage(QWidget):
         outer.addLayout(header)
 
         self.vps_grid = QGridLayout()
-        self.vps_grid.setSpacing(10)
+        self.vps_grid.setSpacing(16)
         outer.addLayout(self.vps_grid)
 
         # Inicializa con cards en estado vacío
+        colores = _cb_brand_colors()
         self._vps_cards_data = [
-            ("ventas_web_hoy",     "Ventas web · hoy"),
-            ("ventas_web_semana",  "Ventas web · 7 días"),
-            ("pedidos_pendientes", "Pedidos pendientes"),
-            ("productos_total",    "Productos en VPS"),
+            ("ventas_web_hoy",     "◎", "Ventas web · hoy",    colores["acento_secundario"]),
+            ("ventas_web_semana",  "∑", "Ventas web · 7 días", colores["primario"]),
+            ("pedidos_pendientes", "◷", "Pedidos pendientes",  colores["acento"]),
+            ("productos_total",    "▦", "Productos en VPS",    colores["primario_oscuro"]),
         ]
         self._vps_cards = {}
-        for idx, (key, label) in enumerate(self._vps_cards_data):
-            card = metric_card(label, "Sin datos", empty=True)
+        for idx, (key, icon, label, accent) in enumerate(self._vps_cards_data):
+            card = _CbKpiCard(icon, label, "Sin datos", "—", accent)
+            card.set_value("Sin datos", empty=True)
             self._vps_cards[key] = card
             self.vps_grid.addWidget(card, idx // 4, idx % 4)
         return panel
@@ -1534,19 +1610,20 @@ class DashboardPage(QWidget):
             self._set_vps_cards_offline("Sin conexión")
             return
 
-        # Actualizar cards
+        # Actualizar cards: (valor grande, subtítulo)
         formatters = {
-            "ventas_web_hoy":     lambda v: f"${v.get('total', 0):,.0f}".replace(",", ".") + f" · {v.get('count', 0)}",
-            "ventas_web_semana":  lambda v: f"${v.get('total', 0):,.0f}".replace(",", ".") + f" · {v.get('count', 0)}",
-            "pedidos_pendientes": lambda v: str(v),
-            "productos_total":    lambda v: str(v),
+            "ventas_web_hoy":     lambda v: (_rt_money(v.get("total", 0)), f"{v.get('count', 0)} venta(s) hoy"),
+            "ventas_web_semana":  lambda v: (_rt_money(v.get("total", 0)), f"{v.get('count', 0)} venta(s) en 7 días"),
+            "pedidos_pendientes": lambda v: (str(v), "por gestionar"),
+            "productos_total":    lambda v: (str(v), "catálogo en producción"),
         }
-        for key, _label in self._vps_cards_data:
+        for key, _icon, _label, _accent in self._vps_cards_data:
             value = stats.get(key, 0)
             if value is None:
-                self._update_card_value(self._vps_cards[key], "Sin datos", empty=True)
+                self._vps_cards[key].set_value("Sin datos", "—", empty=True)
             else:
-                self._update_card_value(self._vps_cards[key], formatters[key](value), empty=False)
+                texto, sub = formatters[key](value)
+                self._vps_cards[key].set_value(texto, sub)
 
         from datetime import datetime
         self.vps_status.setText(
@@ -1554,19 +1631,9 @@ class DashboardPage(QWidget):
         )
 
     def _set_vps_cards_offline(self, reason: str):
-        for key, _label in self._vps_cards_data:
-            self._update_card_value(self._vps_cards[key], "Sin datos", empty=True)
+        for key, _icon, _label, _accent in self._vps_cards_data:
+            self._vps_cards[key].set_value("Sin datos", "—", empty=True)
         self.vps_status.setText(reason)
-
-    def _update_card_value(self, card_frame, new_text: str, empty: bool = False):
-        """Actualiza el QLabel#metricValue del card y marca su estado."""
-        for child in card_frame.findChildren(QLabel):
-            if child.objectName() == "metricValue":
-                child.setText(new_text)
-                child.setProperty("state", "empty" if empty else "")
-                child.style().unpolish(child)
-                child.style().polish(child)
-                return
 
     def _hero_panel(self):
         hero = QFrame()
@@ -1620,16 +1687,102 @@ class DashboardPage(QWidget):
         return hero
 
     def refresh(self):
-        clear_layout(self.metrics_grid)
+        colores = _cb_brand_colors()
         metrics = self.store.dashboard_metrics()
+        extras = self.store.dashboard_extras()
+
+        clear_layout(self.metrics_grid)
+        ventas_hoy_n = extras["ventas_7d"][-1][2] if extras["ventas_7d"] else 0
+        stock_color = colores["peligro"] if metrics["low_stock"] else colores["acento_secundario"]
+        sync_color = colores["acento"] if metrics["pending_sync"] else colores["acento_secundario"]
         cards = [
-            ("Productos activos", str(metrics["products"])),
-            ("Stock bajo", str(metrics["low_stock"])),
-            ("Ventas hoy", f"${metrics['today_sales']:,.0f}"),
-            ("Pendiente sync", str(metrics["pending_sync"])),
+            ("▦", "Productos activos", str(metrics["products"]), "en catálogo local", colores["primario"]),
+            ("⚠", "Stock bajo", str(metrics["low_stock"]),
+             "requieren reposición" if metrics["low_stock"] else "todo en orden", stock_color),
+            ("$", "Ventas hoy", f"${metrics['today_sales']:,.0f}".replace(",", "."),
+             f"{ventas_hoy_n} venta(s) registrada(s)", colores["acento_secundario"]),
+            ("⟳", "Pendiente sync", str(metrics["pending_sync"]),
+             "cambios por enviar" if metrics["pending_sync"] else "todo sincronizado", sync_color),
         ]
-        for index, (label, value) in enumerate(cards):
-            self.metrics_grid.addWidget(metric_card(label, value), 0, index)
+        for index, (icon, label, value, sub, accent) in enumerate(cards):
+            self.metrics_grid.addWidget(_CbKpiCard(icon, label, value, sub, accent), 0, index)
+
+        clear_layout(self.charts_row)
+        self.charts_row.addWidget(self._sales_trend_panel(extras, colores), 5)
+        self.charts_row.addWidget(self._top_products_panel(extras, colores), 4)
+        self.charts_row.addWidget(self._stock_health_panel(extras, colores), 3)
+
+    def _sales_trend_panel(self, extras, colores):
+        panel = QFrame(); panel.setObjectName("sectionPanel"); panel.setMinimumHeight(240)
+        lay = QVBoxLayout(panel); lay.setContentsMargins(16, 12, 16, 10); lay.setSpacing(4)
+        head = QHBoxLayout()
+        eyebrow = QLabel("VENTAS · ÚLTIMOS 7 DÍAS"); eyebrow.setObjectName("eyebrow")
+        head.addWidget(eyebrow); head.addStretch(1)
+        total7 = sum(v for _, v, _ in extras["ventas_7d"])
+        total_lbl = QLabel(_cb_money_compact(total7))
+        total_lbl.setStyleSheet(f"color: {colores['primario']}; font-size: 15px; font-weight: 850;")
+        head.addWidget(total_lbl)
+        lay.addLayout(head)
+        dias_semana = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        from datetime import date as _date
+        labels = []
+        for iso, _v, _c in extras["ventas_7d"]:
+            try:
+                labels.append(dias_semana[_date.fromisoformat(iso).weekday()])
+            except ValueError:
+                labels.append("")
+        spark = _CbSparkline()
+        spark.set_data([v for _, v, _ in extras["ventas_7d"]], labels, colores["primario"])
+        lay.addWidget(spark, 1)
+        return panel
+
+    def _top_products_panel(self, extras, colores):
+        panel = QFrame(); panel.setObjectName("sectionPanel"); panel.setMinimumHeight(240)
+        lay = QVBoxLayout(panel); lay.setContentsMargins(16, 12, 16, 10); lay.setSpacing(6)
+        eyebrow = QLabel("TOP PRODUCTOS · 30 DÍAS"); eyebrow.setObjectName("eyebrow")
+        lay.addWidget(eyebrow)
+        top = extras["top_products"]
+        if not top:
+            vacio = QLabel("Aún no hay ventas para rankear."); vacio.setObjectName("muted")
+            lay.addWidget(vacio, 1, Qt.AlignmentFlag.AlignCenter)
+            return panel
+        palette = _cb_palette(colores)
+        max_u = max(p["unidades"] for p in top) or 1
+        lay.addStretch(1)
+        for i, prod in enumerate(top):
+            color = palette[i % len(palette)]
+            head = QHBoxLayout()
+            name = QLabel(prod["name"])
+            name.setStyleSheet("color: #374151; font-size: 11px; font-weight: 700;")
+            head.addWidget(name, 1)
+            val = QLabel(f"{prod['unidades']} uds · {_cb_money_compact(prod['total'])}")
+            val.setStyleSheet(f"color: {color.name()}; font-size: 11px; font-weight: 800;")
+            head.addWidget(val)
+            lay.addLayout(head)
+            lay.addWidget(_CbMiniBar(prod["unidades"] / max_u, color.name()))
+        lay.addStretch(1)
+        return panel
+
+    def _stock_health_panel(self, extras, colores):
+        panel = QFrame(); panel.setObjectName("sectionPanel"); panel.setMinimumHeight(240)
+        lay = QVBoxLayout(panel); lay.setContentsMargins(16, 12, 16, 10); lay.setSpacing(4)
+        eyebrow = QLabel("SALUD DEL STOCK"); eyebrow.setObjectName("eyebrow")
+        lay.addWidget(eyebrow)
+        ok, low = extras["stock_ok"], extras["stock_low"]
+        total = ok + low
+        donut = _CbDonutChart()
+        donut.setMinimumSize(120, 120)
+        pct = (ok / total * 100) if total else 0
+        donut.set_data(
+            [("Stock sano", ok, QColor(colores["acento_secundario"])),
+             ("Stock bajo", low, QColor(colores["peligro"]))],
+            "stock sano", f"{pct:.0f}%")
+        lay.addWidget(donut, 1)
+        leyenda = QLabel(f"● {ok} sanos&nbsp;&nbsp;&nbsp;<span style='color:{colores['peligro']}'>● {low} bajos</span>")
+        leyenda.setStyleSheet(f"color: {colores['acento_secundario']}; font-size: 11px; font-weight: 700;")
+        leyenda.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(leyenda)
+        return panel
 
     def _module_grid(self):
         frame = QFrame()
@@ -1646,23 +1799,24 @@ class DashboardPage(QWidget):
         outer.addLayout(eyebrow_row)
 
         layout = QGridLayout()
-        layout.setSpacing(10)
+        layout.setSpacing(16)
         outer.addLayout(layout)
 
+        colores = _cb_brand_colors()
         modules = [
-            ("▦", "Productos",   "CRUD local y precios",  "F2", "products"),
-            ("◰", "POS",         "Venta directa offline", "F3", "pos"),
-            ("⊞", "Inventario",  "Entradas y salidas",    "F4", "inventory"),
-            ("$", "Ventas",      "Historial y recibos",   "F5", "sales"),
-            ("◉", "Usuarios",    "CRUD local",            "F6", "users"),
-            ("⟳", "Sync",        "Estado de la BD local", "F7", "sync"),
+            ("▦", "Productos",   "CRUD local y precios",  "F2", "products",  colores["primario"]),
+            ("◰", "POS",         "Venta directa offline", "F3", "pos",       colores["acento_secundario"]),
+            ("⊞", "Inventario",  "Entradas y salidas",    "F4", "inventory", colores["acento"]),
+            ("$", "Ventas",      "Historial y recibos",   "F5", "sales",     colores["primario_oscuro"]),
+            ("◉", "Usuarios",    "CRUD local",            "F6", "users",     colores["peligro"]),
+            ("⟳", "Sync",        "Estado de la BD local", "F7", "sync",      colores["primario"]),
         ]
-        for index, (icon, title, detail, shortcut, target) in enumerate(modules):
-            card = self._module_card(icon, title, detail, shortcut, target)
+        for index, (icon, title, detail, shortcut, target, accent) in enumerate(modules):
+            card = self._module_card(icon, title, detail, shortcut, target, accent)
             layout.addWidget(card, index // 3, index % 3)
         return frame
 
-    def _module_card(self, icon, title, detail, shortcut, target):
+    def _module_card(self, icon, title, detail, shortcut, target, accent=None):
         card = QFrame()
         card.setObjectName("moduleCard")
         card.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1675,6 +1829,11 @@ class DashboardPage(QWidget):
         icon_label = QLabel(icon)
         icon_label.setObjectName("moduleCardIcon")
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if accent:
+            ac = QColor(accent)
+            icon_label.setStyleSheet(
+                f"background: rgba({ac.red()},{ac.green()},{ac.blue()},0.12); color: {accent};"
+            )
         row.addWidget(icon_label)
 
         text_col = QVBoxLayout()
@@ -1736,9 +1895,29 @@ class ProductsPage(QWidget):
 
         form = QFrame()
         form.setObjectName("sectionPanel")
-        form_layout = QGridLayout(form)
-        form_layout.setContentsMargins(16, 16, 16, 16)
-        form_layout.setSpacing(10)
+        form_outer = QVBoxLayout(form)
+        form_outer.setContentsMargins(16, 14, 16, 14)
+        form_outer.setSpacing(10)
+
+        ed_head = QHBoxLayout()
+        self.editor_title = QLabel("NUEVO PRODUCTO")
+        self.editor_title.setObjectName("eyebrow")
+        ed_head.addWidget(self.editor_title)
+        ed_head.addStretch(1)
+        editor_hint = QLabel("Selecciona una fila para editar · SKU y nombre son obligatorios")
+        editor_hint.setObjectName("muted")
+        ed_head.addWidget(editor_hint)
+        form_outer.addLayout(ed_head)
+
+        form_layout = QGridLayout()
+        form_layout.setHorizontalSpacing(12)
+        form_layout.setVerticalSpacing(4)
+        form_outer.addLayout(form_layout)
+
+        def _flabel(text):
+            lbl = QLabel(text.upper())
+            lbl.setObjectName("eyebrowMuted")
+            return lbl
 
         self.sku = QLineEdit()
         self.barcode = QLineEdit()
@@ -1785,20 +1964,20 @@ class ProductsPage(QWidget):
             ("Genero (sync con web)", self.genero_combo),
         ]
         for index, (label, widget) in enumerate(fields):
-            form_layout.addWidget(QLabel(label), index // 3 * 2, index % 3)
+            form_layout.addWidget(_flabel(label), index // 3 * 2, index % 3)
             form_layout.addWidget(widget, index // 3 * 2 + 1, index % 3)
         # Imagen ocupa toda la fila siguiente
         next_row = ((len(fields) - 1) // 3 + 1) * 2
-        form_layout.addWidget(QLabel("Imagen"), next_row, 0)
+        form_layout.addWidget(_flabel("Imagen"), next_row, 0)
         form_layout.addLayout(image_row, next_row + 1, 0, 1, 3)
 
         actions = QHBoxLayout()
-        self.save_btn = QPushButton("Guardar producto")
+        self.save_btn = QPushButton("✓  Guardar producto")
         self.save_btn.clicked.connect(self._save)
-        self.new_btn = QPushButton("Nuevo")
+        self.new_btn = QPushButton("＋  Nuevo")
         self.new_btn.setObjectName("secondaryAction")
         self.new_btn.clicked.connect(self._clear_form)
-        self.delete_btn = QPushButton("Desactivar")
+        self.delete_btn = QPushButton("⊘  Desactivar")
         self.delete_btn.setObjectName("dangerAction")
         self.delete_btn.clicked.connect(self._delete)
         actions.addWidget(self.save_btn)
@@ -1810,20 +1989,20 @@ class ProductsPage(QWidget):
         self.live_badge.setProperty("state", "warning")
         self.live_badge.setVisible(False)
         actions.addWidget(self.live_badge)
+        form_outer.addLayout(actions)
 
         layout.addWidget(form)
-        layout.addLayout(actions)
 
-        # Buscador
+        # Buscador + chips de resumen
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
-        search_label = QLabel("Buscar:")
-        search_label.setObjectName("muted")
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Filtrar por SKU, barcode, nombre o categoria")
+        self.search.setPlaceholderText("⌕  Buscar por SKU, barcode, nombre o categoría")
         self.search.textChanged.connect(self._apply_filter)
-        search_row.addWidget(search_label)
         search_row.addWidget(self.search, 1)
+        self.chips_row = QHBoxLayout()
+        self.chips_row.setSpacing(6)
+        search_row.addLayout(self.chips_row)
         layout.addLayout(search_row)
 
         self.table = QTableWidget()
@@ -1831,6 +2010,11 @@ class ProductsPage(QWidget):
         self.table.setHorizontalHeaderLabels(["ID", "SKU", "Barcode", "Nombre", "Categoria", "Stock", "Minimo", "Precio"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
+        self.table.setColumnHidden(0, True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._load_selected)
         layout.addWidget(self.table)
         self.refresh()
@@ -1865,6 +2049,10 @@ class ProductsPage(QWidget):
             or needle in p["name"].lower()
             or needle in (p.get("category") or "").lower()
         ]
+        colores = _cb_brand_colors()
+        palette = _cb_palette(colores)
+        cat_colors = {}
+        peligro = QColor(colores["peligro"])
         self.table.setRowCount(len(rows))
         for row_index, product in enumerate(rows):
             values = [
@@ -1875,16 +2063,37 @@ class ProductsPage(QWidget):
                 product["category"],
                 product["stock"],
                 product["min_stock"],
-                f"{product['price']:.2f}",
+                f"${float(product['price']):,.0f}".replace(",", "."),
             ]
             low_stock = int(product["stock"]) <= int(product["min_stock"])
+            cat = product.get("category") or "General"
+            if cat not in cat_colors:
+                cat_colors[cat] = palette[len(cat_colors) % len(palette)]
             for col_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if col_index == 0:
                     item.setData(Qt.ItemDataRole.UserRole, product["id"])
-                if low_stock and col_index == 5:
-                    item.setForeground(Qt.GlobalColor.red)
+                if col_index == 4:
+                    item.setForeground(QBrush(cat_colors[cat]))
+                if col_index == 5 and low_stock:
+                    item.setText(f"{value} ⚠")
+                    item.setForeground(QBrush(peligro))
+                    bold = item.font(); bold.setBold(True); item.setFont(bold)
+                if col_index == 7:
+                    item.setForeground(QBrush(QColor(colores["primario_oscuro"])))
                 self.table.setItem(row_index, col_index, item)
+
+        # Chips de resumen del catálogo completo
+        total = len(self._all_products)
+        low = sum(1 for p in self._all_products if int(p["stock"]) <= int(p["min_stock"]))
+        valor = sum(float(p["price"]) * int(p["stock"]) for p in self._all_products)
+        clear_layout(self.chips_row)
+        self.chips_row.addWidget(_cb_chip(f"▦ {total} productos", colores["primario"]))
+        if low:
+            self.chips_row.addWidget(_cb_chip(f"⚠ {low} con stock bajo", colores["peligro"]))
+        else:
+            self.chips_row.addWidget(_cb_chip("✓ Stock saludable", colores["acento_secundario"]))
+        self.chips_row.addWidget(_cb_chip(f"Inventario {_cb_money_compact(valor)}", colores["acento"]))
 
     def _load_selected(self):
         row = self.table.currentRow()
@@ -1893,27 +2102,25 @@ class ProductsPage(QWidget):
         item0 = self.table.item(row, 0)
         if item0 is None:
             return
-        self.selected_id = int(item0.text())
-        self.sku.setText(self.table.item(row, 1).text())
-        self.barcode.setText(self.table.item(row, 2).text())
-        self.name.setText(self.table.item(row, 3).text())
-        self.category.setText(self.table.item(row, 4).text())
-        self.stock.setValue(int(self.table.item(row, 5).text()))
-        self.min_stock.setValue(int(self.table.item(row, 6).text()))
-        self.price.setValue(float(self.table.item(row, 7).text()))
-        # Cargar imagen y genero del producto seleccionado
-        prod = next((p for p in self._all_products if p["id"] == self.selected_id), None)
-        if prod:
-            self.image_path.setText(prod.get("image_path") or "")
-            gid = prod.get("genero_id")
-            if gid is not None:
-                idx = self.genero_combo.findData(gid)
-                if idx >= 0:
-                    self.genero_combo.setCurrentIndex(idx)
-                else:
-                    self.genero_combo.setCurrentIndex(0)
-            else:
-                self.genero_combo.setCurrentIndex(0)
+        pid = item0.data(Qt.ItemDataRole.UserRole)
+        prod = next((p for p in self._all_products if p["id"] == pid), None)
+        if prod is None:
+            return  # modo "VPS en vivo": tabla de solo lectura, no carga al editor
+        self.selected_id = prod["id"]
+        self.sku.setText(prod["sku"] or "")
+        self.barcode.setText(prod.get("barcode") or "")
+        self.name.setText(prod["name"])
+        self.category.setText(prod.get("category") or "General")
+        self.stock.setValue(int(prod["stock"]))
+        self.min_stock.setValue(int(prod["min_stock"]))
+        self.price.setValue(float(prod["price"]))
+        self.image_path.setText(prod.get("image_path") or "")
+        gid = prod.get("genero_id")
+        idx = self.genero_combo.findData(gid) if gid is not None else 0
+        self.genero_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        colores = _cb_brand_colors()
+        self.editor_title.setText(f"EDITANDO · {prod['name'].upper()}")
+        self.editor_title.setStyleSheet(f"color: {colores['acento']};")
 
     def _save(self):
         if not self.sku.text().strip() or not self.name.text().strip():
@@ -1966,6 +2173,8 @@ class ProductsPage(QWidget):
         self.price.setValue(0)
         self.image_path.clear()
         self.genero_combo.setCurrentIndex(0)
+        self.editor_title.setText("NUEVO PRODUCTO")
+        self.editor_title.setStyleSheet("")
 
     # ── Categorías (modal CRUD bidi con VPS) ──
     def _open_categories_dialog(self):
@@ -2299,37 +2508,65 @@ class PosPage(QWidget):
 
         layout.addWidget(scanner_panel)
 
+        colores = _cb_brand_colors()
+        content = QHBoxLayout()
+        content.setSpacing(12)
+
+        # ─── Columna izquierda: alta manual + carrito ───
+        left = QVBoxLayout()
+        left.setSpacing(10)
+
         panel = QFrame()
         panel.setObjectName("sectionPanel")
         form = QGridLayout(panel)
-        form.setContentsMargins(16, 16, 16, 16)
-        form.setSpacing(10)
+        form.setContentsMargins(16, 12, 16, 14)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(4)
 
         self.product = QComboBox()
         self.quantity = QSpinBox()
         self.quantity.setRange(1, 9999)
         self.quantity.setValue(1)
-        add = QPushButton("Agregar")
+        add = QPushButton("＋  Agregar")
         add.clicked.connect(self._add_item)
-        sell = QPushButton("Finalizar venta")
+        sell = QPushButton("✓  Finalizar venta")
         sell.setObjectName("primaryAction")
+        sell.setMinimumHeight(48)
         sell.clicked.connect(self._finish_sale)
-        clear = QPushButton("Limpiar")
+        clear = QPushButton("Limpiar carrito")
         clear.setObjectName("secondaryAction")
         clear.clicked.connect(self._clear_cart)
 
-        form.addWidget(QLabel("Producto (busqueda manual)"), 0, 0)
+        lbl_prod = QLabel("PRODUCTO (BÚSQUEDA MANUAL)"); lbl_prod.setObjectName("eyebrowMuted")
+        lbl_cant = QLabel("CANTIDAD"); lbl_cant.setObjectName("eyebrowMuted")
+        form.addWidget(lbl_prod, 0, 0)
         form.addWidget(self.product, 1, 0)
-        form.addWidget(QLabel("Cantidad"), 0, 1)
+        form.addWidget(lbl_cant, 0, 1)
         form.addWidget(self.quantity, 1, 1)
         form.addWidget(add, 1, 2)
-        form.addWidget(sell, 1, 3)
-        form.addWidget(clear, 1, 4)
-        layout.addWidget(panel)
+        form.setColumnStretch(0, 1)
+        left.addWidget(panel)
 
-        self.total_label = QLabel("Total: $0")
-        self.total_label.setObjectName("metricValue")
-        layout.addWidget(self.total_label)
+        # Carrito: tabla o estado vacío
+        self.cart_stack = QStackedWidget()
+        empty = QFrame()
+        empty.setObjectName("sectionPanel")
+        ev = QVBoxLayout(empty)
+        ev.addStretch(1)
+        e_icon = QLabel("⌗")
+        e_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        e_icon.setStyleSheet(f"color: {colores['primario']}; font-size: 44px; font-weight: 800;")
+        ev.addWidget(e_icon)
+        e_txt = QLabel("Carrito vacío")
+        e_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        e_txt.setStyleSheet(f"color: {colores['primario_oscuro']}; font-size: 17px; font-weight: 800;")
+        ev.addWidget(e_txt)
+        e_sub = QLabel("Escanea un código de barras o agrega un producto manualmente.")
+        e_sub.setObjectName("muted")
+        e_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ev.addWidget(e_sub)
+        ev.addStretch(1)
+        self.cart_stack.addWidget(empty)
 
         self.table = QTableWidget()
         self.table.setColumnCount(6)
@@ -2337,11 +2574,45 @@ class PosPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
         self.table.setColumnHidden(5, True)
-        layout.addWidget(self.table)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.cart_stack.addWidget(self.table)
+        left.addWidget(self.cart_stack, 1)
 
         self.feedback = QLabel("Listo. Conecta tu pistola USB y escanea, o escribe el codigo arriba.")
         self.feedback.setObjectName("muted")
-        layout.addWidget(self.feedback)
+        left.addWidget(self.feedback)
+        content.addLayout(left, 1)
+
+        # ─── Columna derecha: ticket de venta ───
+        ticket = QFrame()
+        ticket.setObjectName("sectionPanel")
+        ticket.setFixedWidth(280)
+        tv = QVBoxLayout(ticket)
+        tv.setContentsMargins(18, 16, 18, 16)
+        tv.setSpacing(6)
+        t_head = QLabel("RESUMEN DE VENTA")
+        t_head.setObjectName("eyebrow")
+        tv.addWidget(t_head)
+        self.items_label = QLabel("0 artículos")
+        self.items_label.setObjectName("muted")
+        tv.addWidget(self.items_label)
+        tv.addSpacing(6)
+        t_total_cap = QLabel("TOTAL A COBRAR")
+        t_total_cap.setObjectName("eyebrowMuted")
+        tv.addWidget(t_total_cap)
+        self.total_label = QLabel("$0")
+        self.total_label.setStyleSheet(
+            f"color: {colores['primario_oscuro']}; font-size: 36px; font-weight: 850; letter-spacing: -0.8px;"
+        )
+        tv.addWidget(self.total_label)
+        tv.addStretch(1)
+        tv.addWidget(sell)
+        tv.addWidget(clear)
+        content.addWidget(ticket)
+
+        layout.addLayout(content, 1)
 
         if self.scanner is not None:
             self.scanner.enabled_changed.connect(self._update_scanner_badge)
@@ -2476,28 +2747,81 @@ class PosPage(QWidget):
         self._notify("Carrito limpiado.")
 
     def _render_cart(self):
+        colores = _cb_brand_colors()
+        self.cart_stack.setCurrentIndex(1 if self.cart else 0)
         self.table.setRowCount(len(self.cart))
         total = 0.0
+        unidades = 0
         for row_index, item in enumerate(self.cart):
             subtotal = item["quantity"] * item["unit_price"]
             total += subtotal
-            values = [
-                item["name"],
-                item["quantity"],
-                f"${item['unit_price']:,.0f}",
-                f"${subtotal:,.0f}",
-                "",
-                item["product_id"],
-            ]
-            for col_index, value in enumerate(values):
-                if col_index == 4:
-                    btn = QPushButton("Quitar")
-                    btn.setObjectName("inlineDanger")
-                    btn.clicked.connect(lambda _checked=False, pid=item["product_id"]: self._remove_item(pid))
-                    self.table.setCellWidget(row_index, col_index, btn)
-                else:
-                    self.table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
-        self.total_label.setText(f"Total: ${total:,.0f}")
+            unidades += item["quantity"]
+
+            name_item = QTableWidgetItem(item["name"])
+            self.table.setItem(row_index, 0, name_item)
+            self.table.setCellWidget(row_index, 1, self._qty_widget(item, colores))
+            price_item = QTableWidgetItem(f"${item['unit_price']:,.0f}".replace(",", "."))
+            price_item.setForeground(QBrush(QColor("#6b7280")))
+            self.table.setItem(row_index, 2, price_item)
+            sub_item = QTableWidgetItem(f"${subtotal:,.0f}".replace(",", "."))
+            sub_item.setForeground(QBrush(QColor(colores["primario_oscuro"])))
+            bold = sub_item.font(); bold.setBold(True); sub_item.setFont(bold)
+            self.table.setItem(row_index, 3, sub_item)
+            btn = QPushButton("✕")
+            btn.setObjectName("inlineDanger")
+            btn.setFixedWidth(34)
+            btn.setStyleSheet("padding: 0; min-height: 24px;")
+            btn.setToolTip("Quitar del carrito")
+            btn.clicked.connect(lambda _checked=False, pid=item["product_id"]: self._remove_item(pid))
+            wrap = QWidget(); wl = QHBoxLayout(wrap)
+            wl.setContentsMargins(0, 2, 0, 2)
+            wl.addStretch(1); wl.addWidget(btn); wl.addStretch(1)
+            self.table.setCellWidget(row_index, 4, wrap)
+            self.table.setItem(row_index, 5, QTableWidgetItem(str(item["product_id"])))
+        self.total_label.setText(f"${total:,.0f}".replace(",", "."))
+        n = len(self.cart)
+        self.items_label.setText(f"{n} artículo(s) · {unidades} unidad(es)" if n else "0 artículos")
+
+    def _qty_widget(self, item, colores):
+        """Control −/+ de cantidad para una fila del carrito."""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 2, 0, 2)
+        h.setSpacing(6)
+        ac = QColor(colores["primario"])
+        btn_style = (
+            f"QPushButton {{ background: rgba({ac.red()},{ac.green()},{ac.blue()},0.10);"
+            f" color: {colores['primario']}; border: 0; border-radius: 12px;"
+            f" font-size: 14px; font-weight: 800; padding: 0;"
+            f" min-height: 24px; min-width: 26px; }}"
+            f"QPushButton:hover {{ background: rgba({ac.red()},{ac.green()},{ac.blue()},0.22); }}"
+        )
+        minus = QPushButton("−"); plus = QPushButton("＋")
+        for b in (minus, plus):
+            b.setFixedSize(26, 24)
+            b.setStyleSheet(btn_style)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        qty = QLabel(str(item["quantity"]))
+        qty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qty.setMinimumWidth(28)
+        qty.setStyleSheet(f"color: {colores['primario_oscuro']}; font-weight: 800;")
+        pid = item["product_id"]
+        minus.clicked.connect(lambda _=False: self._change_qty(pid, -1))
+        plus.clicked.connect(lambda _=False: self._change_qty(pid, +1))
+        h.addStretch(1)
+        h.addWidget(minus); h.addWidget(qty); h.addWidget(plus)
+        h.addStretch(1)
+        return w
+
+    def _change_qty(self, product_id, delta):
+        item = next((i for i in self.cart if i["product_id"] == product_id), None)
+        if item is None:
+            return
+        item["quantity"] += delta
+        if item["quantity"] <= 0:
+            self.cart.remove(item)
+            self._notify("Item removido del carrito.")
+        self._render_cart()
 
     def _remove_item(self, product_id):
         self.cart = [item for item in self.cart if item["product_id"] != product_id]
@@ -3331,8 +3655,22 @@ class SyncPage(QWidget):
         client = self._build_client()
         stats = {"pulled_generos": 0, "pulled_products": 0, "pulled_users": 0,
                  "pulled_sales_web": 0, "pulled_inventory_log": 0, "pulled_restaurant": 0, "pulled_contabilidad": 0,
+                 "pulled_modules": 0,
                  "pushed_applied": 0, "pushed_skipped": 0, "pushed_stale": 0,
                  "pushed_errors": 0}
+
+        # --- Pull flags de módulos del plan (gating por tenant) ---
+        # Aislado en su propio try/except: nunca debe romper el sync de datos.
+        try:
+            cfg = client.pull_config()
+            mods = cfg.get("modules")
+            if isinstance(mods, dict) and mods:   # solo persistir si trae algo (no pisar caché buena con {})
+                self.store.set_tenant_modules(mods)
+                stats["pulled_modules"] = len(mods)
+        except SyncError as exc:
+            print(f"[sync] pull_config: {exc}")
+        except Exception as exc:
+            print(f"[sync] pull_config inesperado: {exc}")
 
         # --- Pull generos ---
         # Auto-sanación: si la tabla local está vacía pero el cursor quedó
@@ -4562,6 +4900,303 @@ def _cb_cat_label(cat: str) -> str:
     return (cat or "").replace("_", " ").capitalize() if cat else "—"
 
 
+def _cb_brand_colors() -> dict:
+    """Colores institucionales vigentes (branding.json) para pintar gráficos."""
+    return branding_mod.load_branding(app_data_dir())["colores"]
+
+
+def _cb_palette(colores: dict) -> list:
+    """Paleta cíclica para series categóricas, derivada de la marca."""
+    base = [
+        QColor(colores["primario"]),
+        QColor(colores["acento"]),
+        QColor(colores["acento_secundario"]),
+        QColor(colores["primario_oscuro"]),
+        QColor(colores["peligro"]),
+    ]
+    return base + [c.lighter(140) for c in base]
+
+
+def _cb_money_compact(value: float) -> str:
+    """$1.2M / $850K para etiquetas cortas dentro de los gráficos."""
+    v = float(value or 0)
+    if abs(v) >= 1_000_000:
+        return f"${v / 1_000_000:.1f}M".replace(".0M", "M")
+    if abs(v) >= 10_000:
+        return f"${v / 1_000:.0f}K"
+    return _rt_money(v)
+
+
+class _CbKpiCard(QFrame):
+    """Tarjeta KPI con franja de acento, ícono y subtítulo, en color de marca."""
+
+    def __init__(self, icon: str, label: str, value: str, sub: str, accent: str):
+        super().__init__()
+        self._accent = accent
+        ac = QColor(accent)
+        self.setStyleSheet(
+            f"QFrame {{ background: #ffffff; border: 1px solid #e5e7eb;"
+            f" border-top: 3px solid {accent}; border-radius: 14px; }}"
+            f"QLabel {{ border: 0; }}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(2)
+        top = QHBoxLayout(); top.setSpacing(8)
+        chip = QLabel(icon)
+        chip.setFixedSize(30, 30)
+        chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        chip.setStyleSheet(
+            f"background: rgba({ac.red()},{ac.green()},{ac.blue()},0.14);"
+            f" color: {accent}; border-radius: 15px; font-size: 14px;"
+        )
+        top.addWidget(chip)
+        lbl = QLabel(label.upper())
+        lbl.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 800; letter-spacing: 1.4px;")
+        top.addWidget(lbl, 1)
+        lay.addLayout(top)
+        self._value_lbl = QLabel(value)
+        self._value_style = f"color: {accent}; font-size: 24px; font-weight: 850; letter-spacing: -0.4px;"
+        self._value_lbl.setStyleSheet(self._value_style)
+        lay.addWidget(self._value_lbl)
+        self._sub_lbl = QLabel(sub)
+        self._sub_lbl.setStyleSheet("color: #9ca3af; font-size: 11px; font-weight: 600;")
+        lay.addWidget(self._sub_lbl)
+
+    def set_value(self, value: str, sub: str | None = None, empty: bool = False):
+        self._value_lbl.setText(value)
+        if empty:
+            self._value_lbl.setStyleSheet("color: #c2c8d4; font-size: 24px; font-weight: 850; letter-spacing: -0.4px;")
+        else:
+            self._value_lbl.setStyleSheet(self._value_style)
+        if sub is not None:
+            self._sub_lbl.setText(sub)
+
+
+def _cb_chip(text: str, color: str) -> QLabel:
+    """Pastilla informativa con tinte del color de marca."""
+    c = QColor(color)
+    chip = QLabel(text)
+    chip.setStyleSheet(
+        f"background: rgba({c.red()},{c.green()},{c.blue()},0.12); color: {color};"
+        f" border-radius: 11px; padding: 4px 10px; font-size: 11px; font-weight: 800;"
+    )
+    return chip
+
+
+class _CbSparkline(QWidget):
+    """Línea de tendencia compacta con relleno degradado y punto final."""
+
+    def __init__(self):
+        super().__init__()
+        self.values: list = []
+        self.labels: list = []
+        self.color = QColor("#122C94")
+        self.setMinimumHeight(86)
+
+    def set_data(self, values, labels, color: str):
+        self.values = [float(v) for v in values]
+        self.labels = labels
+        self.color = QColor(color)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        if not self.values or max(self.values) <= 0:
+            p.setPen(QColor("#9ca3af"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Sin ventas registradas")
+            return
+        margin_b = 16
+        plot_h = h - 10 - margin_b
+        max_v = max(self.values)
+        n = len(self.values)
+        step = w / max(1, n - 1)
+        pts = [QPointF(i * step, 10 + plot_h * (1 - v / max_v)) for i, v in enumerate(self.values)]
+        # relleno bajo la curva
+        fill = QPainterPath()
+        fill.moveTo(QPointF(0, 10 + plot_h))
+        for pt in pts:
+            fill.lineTo(pt)
+        fill.lineTo(QPointF(w, 10 + plot_h))
+        fill.closeSubpath()
+        soft = QColor(self.color); soft.setAlpha(36)
+        p.fillPath(fill, QBrush(soft))
+        # línea
+        line = QPainterPath(pts[0])
+        for pt in pts[1:]:
+            line.lineTo(pt)
+        pen = QPen(self.color, 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPath(line)
+        # punto final
+        p.setBrush(QBrush(self.color))
+        p.drawEllipse(pts[-1], 3.5, 3.5)
+        # etiquetas eje X
+        f = QFont(self.font()); f.setPointSize(7)
+        p.setFont(f)
+        p.setPen(QColor("#9ca3af"))
+        for i, lbl in enumerate(self.labels):
+            p.drawText(QRectF(i * step - step / 2, h - 13, step, 12),
+                       Qt.AlignmentFlag.AlignHCenter, lbl)
+        p.end()
+
+
+class _CbFlowChart(QWidget):
+    """Barras agrupadas ingresos vs egresos por sub-período, con tooltip por barra."""
+
+    def __init__(self):
+        super().__init__()
+        self.labels: list = []
+        self.ingresos: list = []
+        self.egresos: list = []
+        self.color_in = QColor("#a6c438")
+        self.color_eg = QColor("#b42318")
+        self._bar_hits: list = []  # (QRectF, texto tooltip)
+        self.setMinimumHeight(210)
+        self.setMouseTracking(True)
+
+    def set_data(self, labels, ingresos, egresos, color_in: str, color_eg: str):
+        self.labels = labels
+        self.ingresos = ingresos
+        self.egresos = egresos
+        self.color_in = QColor(color_in)
+        self.color_eg = QColor(color_eg)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        for rect, tip in self._bar_hits:
+            if rect.contains(pos):
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+                return
+        QToolTip.hideText()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        self._bar_hits = []
+        max_val = max(self.ingresos + self.egresos + [0])
+        if not self.labels or max_val <= 0:
+            p.setPen(QColor("#9ca3af"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Sin movimientos en el período.")
+            return
+        margin_l, margin_b, margin_t = 8, 24, 14
+        plot_w = w - margin_l - 8
+        plot_h = h - margin_t - margin_b
+        # líneas guía horizontales
+        p.setPen(QPen(QColor("#eef1f6"), 1))
+        for i in range(1, 4):
+            y = margin_t + plot_h * i / 4
+            p.drawLine(margin_l, int(y), w - 8, int(y))
+        p.setPen(QPen(QColor("#d1d5db"), 1))
+        p.drawLine(margin_l, margin_t + plot_h, w - 8, margin_t + plot_h)
+
+        n = len(self.labels)
+        slot = plot_w / n
+        bar_w = max(3.0, min(18.0, slot * 0.32))
+        gap = bar_w * 0.25
+        label_font = QFont(self.font()); label_font.setPointSize(7)
+        label_step = max(1, n // 10)  # no amontonar etiquetas del eje X
+        for i in range(n):
+            cx = margin_l + slot * i + slot / 2
+            for value, color, tipo in (
+                (self.ingresos[i], self.color_in, "Ingresos"),
+                (self.egresos[i], self.color_eg, "Egresos"),
+            ):
+                x = cx - bar_w - gap / 2 if tipo == "Ingresos" else cx + gap / 2
+                bh = plot_h * (value / max_val)
+                rect = QRectF(x, margin_t + plot_h - bh, bar_w, bh)
+                path = QPainterPath()
+                path.addRoundedRect(rect, 3, 3)
+                p.fillPath(path, QBrush(color))
+                hit = QRectF(x, margin_t, bar_w, plot_h)
+                self._bar_hits.append((hit, f"{self.labels[i]} · {tipo}: {_rt_money(value)}"))
+            if i % label_step == 0:
+                p.setPen(QColor("#6b7280"))
+                p.setFont(label_font)
+                p.drawText(QRectF(cx - slot / 2, margin_t + plot_h + 4, slot, 16),
+                           Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self.labels[i])
+        p.end()
+
+
+class _CbDonutChart(QWidget):
+    """Dona de distribución con total en el centro."""
+
+    def __init__(self):
+        super().__init__()
+        self.items: list = []  # (label, value, QColor)
+        self.center_title = ""
+        self.center_value: str | None = None
+        self.setMinimumSize(170, 190)
+
+    def set_data(self, items, center_title: str, center_value: str | None = None):
+        self.items = [(lbl, float(v), col) for lbl, v, col in items if float(v) > 0]
+        self.center_title = center_title
+        self.center_value = center_value
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        total = sum(v for _, v, _ in self.items)
+        side = min(self.width(), self.height()) - 16
+        rect = QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side)
+        if total <= 0:
+            p.setPen(QPen(QColor("#e5e7eb"), 16))
+            p.drawEllipse(rect.adjusted(10, 10, -10, -10))
+            p.setPen(QColor("#9ca3af"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Sin datos")
+            return
+        start = 90 * 16  # arriba, sentido horario
+        ring = max(14.0, side * 0.13)
+        arc_rect = rect.adjusted(ring / 2 + 4, ring / 2 + 4, -ring / 2 - 4, -ring / 2 - 4)
+        for _, value, color in self.items:
+            span = -int(round(5760 * value / total))
+            pen = QPen(color, ring)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.setPen(pen)
+            p.drawArc(arc_rect, start, span)
+            start += span
+        p.setPen(QColor("#111827"))
+        f = QFont(self.font()); f.setPointSize(13); f.setWeight(QFont.Weight.ExtraBold)
+        p.setFont(f)
+        p.drawText(rect.adjusted(0, -10, 0, -10), Qt.AlignmentFlag.AlignCenter,
+                   self.center_value if self.center_value is not None else _cb_money_compact(total))
+        p.setPen(QColor("#6b7280"))
+        f2 = QFont(self.font()); f2.setPointSize(7); f2.setWeight(QFont.Weight.Bold)
+        p.setFont(f2)
+        p.drawText(rect.adjusted(0, 18, 0, 18), Qt.AlignmentFlag.AlignCenter, self.center_title.upper())
+        p.end()
+
+
+class _CbMiniBar(QWidget):
+    """Barra horizontal de progreso para desgloses (retenciones, categorías)."""
+
+    def __init__(self, pct: float, color: str):
+        super().__init__()
+        self.pct = max(0.0, min(1.0, pct))
+        self.color = QColor(color)
+        self.setFixedHeight(8)
+        self.setMinimumWidth(70)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = QPainterPath()
+        track.addRoundedRect(QRectF(0, 1, self.width(), 6), 3, 3)
+        p.fillPath(track, QBrush(QColor("#eef1f6")))
+        if self.pct > 0:
+            fill = QPainterPath()
+            fill.addRoundedRect(QRectF(0, 1, max(6.0, self.width() * self.pct), 6), 3, 3)
+            p.fillPath(fill, QBrush(self.color))
+        p.end()
+
+
 class MovimientoDialog(QDialog):
     """Alta de un movimiento contable con preview de impuestos/retenciones."""
 
@@ -4773,6 +5408,9 @@ class ContabilidadPage(QWidget):
     # ─── Dashboard ─────────────────────────────────────────────────
     def _render_dashboard(self):
         lay = self.tab_dash.layout(); clear_layout(lay)
+        colores = _cb_brand_colors()
+        d = self.store.cb_dashboard(self._periodo)
+
         bar = QHBoxLayout()
         lbl = QLabel("Período:"); lbl.setObjectName("fieldLabel")
         bar.addWidget(lbl)
@@ -4782,39 +5420,148 @@ class ContabilidadPage(QWidget):
         idx = max(0, self.periodo_combo.findData(self._periodo))
         self.periodo_combo.setCurrentIndex(idx)
         self.periodo_combo.currentIndexChanged.connect(self._on_periodo)
-        bar.addWidget(self.periodo_combo); bar.addStretch(1)
+        bar.addWidget(self.periodo_combo)
+        rango = QLabel(f"{d['rango'][0]}  →  {d['rango'][1]}")
+        rango.setObjectName("muted")
+        bar.addWidget(rango)
+        bar.addStretch(1)
         lay.addLayout(bar)
 
-        d = self.store.cb_dashboard(self._periodo)
+        # KPIs con acento institucional
         cards = QGridLayout(); cards.setSpacing(10)
-        cards.addWidget(metric_card("Ingresos netos", _rt_money(d["ingresos"])), 0, 0)
-        cards.addWidget(metric_card("Egresos", _rt_money(d["egresos"])), 0, 1)
-        cards.addWidget(metric_card("Saldo", _rt_money(d["saldo"])), 0, 2)
-        cards.addWidget(metric_card("Retenciones", _rt_money(d["retenciones"])), 0, 3)
+        cards.addWidget(_CbKpiCard("▲", "Ingresos netos", _rt_money(d["ingresos"]),
+                                   f"{d['num_ingresos']} movimiento(s)", colores["acento_secundario"]), 0, 0)
+        cards.addWidget(_CbKpiCard("▼", "Egresos", _rt_money(d["egresos"]),
+                                   f"{d['num_egresos']} movimiento(s)", colores["peligro"]), 0, 1)
+        saldo_color = colores["primario"] if d["saldo"] >= 0 else colores["peligro"]
+        margen = (d["saldo"] / d["ingresos"] * 100) if d["ingresos"] else 0
+        cards.addWidget(_CbKpiCard("Σ", "Saldo", _rt_money(d["saldo"]),
+                                   f"Margen {margen:.0f}% sobre ingresos" if d["ingresos"] else "Sin ingresos en el período",
+                                   saldo_color), 0, 2)
+        cards.addWidget(_CbKpiCard("％", "Retenciones", _rt_money(d["retenciones"]),
+                                   f"Bruto ingresos {_cb_money_compact(d['ingresos_bruto'])}", colores["acento"]), 0, 3)
         lay.addLayout(cards)
 
-        # Desglose retenciones
+        # Fila de gráficos: flujo temporal + dona por categoría
+        charts = QHBoxLayout(); charts.setSpacing(10)
+
+        flow_panel = QFrame(); flow_panel.setObjectName("sectionPanel")
+        fl = QVBoxLayout(flow_panel); fl.setContentsMargins(16, 12, 16, 10); fl.setSpacing(6)
+        fhead = QHBoxLayout()
+        fhead.addWidget(self._eyebrow("FLUJO DEL PERÍODO"))
+        fhead.addStretch(1)
+        for txt, col in (("● Ingresos", colores["acento_secundario"]), ("● Egresos", colores["peligro"])):
+            chip = QLabel(txt)
+            chip.setStyleSheet(f"color: {col}; font-size: 11px; font-weight: 700;")
+            fhead.addWidget(chip)
+        fl.addLayout(fhead)
+        labels, serie_in, serie_eg = self._series_for_period(d["rango"])
+        flow = _CbFlowChart()
+        flow.set_data(labels, serie_in, serie_eg, colores["acento_secundario"], colores["peligro"])
+        fl.addWidget(flow, 1)
+        charts.addWidget(flow_panel, 3)
+
+        cat_panel = QFrame(); cat_panel.setObjectName("sectionPanel")
+        cl = QVBoxLayout(cat_panel); cl.setContentsMargins(16, 12, 16, 10); cl.setSpacing(6)
+        cl.addWidget(self._eyebrow("DISTRIBUCIÓN POR CATEGORÍA"))
+        cats = d["por_categoria"]
+        if not cats:
+            donut_body = QHBoxLayout()
+            donut = _CbDonutChart(); donut.set_data([], "movido")
+            donut_body.addWidget(donut, 1)
+            cl.addLayout(donut_body, 1)
+        else:
+            palette = _cb_palette(colores)
+            top = cats[:5]
+            resto = sum(float(r["total"]) for r in cats[5:])
+            items, total_cat = [], sum(float(r["total"]) for r in cats)
+            for i, r in enumerate(top):
+                items.append((f"{_cb_cat_label(r['categoria'])} ({_CB_TIPO_LABEL.get(r['tipo'], r['tipo'])})",
+                              float(r["total"]), palette[i % len(palette)]))
+            if resto > 0:
+                items.append(("Otros", resto, QColor("#9ca3af")))
+            donut_body = QHBoxLayout(); donut_body.setSpacing(10)
+            donut = _CbDonutChart()
+            donut.set_data(items, "movido")
+            donut_body.addWidget(donut, 1)
+            legend = QVBoxLayout(); legend.setSpacing(6)
+            legend.addStretch(1)
+            for label_txt, value, color in items:
+                row = QVBoxLayout(); row.setSpacing(2)
+                head = QHBoxLayout()
+                name = QLabel(label_txt)
+                name.setStyleSheet(f"color: #374151; font-size: 11px; font-weight: 700;")
+                head.addWidget(name, 1)
+                val = QLabel(_cb_money_compact(value))
+                val.setStyleSheet(f"color: {color.name()}; font-size: 11px; font-weight: 800;")
+                head.addWidget(val)
+                row.addLayout(head)
+                row.addWidget(_CbMiniBar(value / total_cat if total_cat else 0, color.name()))
+                legend.addLayout(row)
+            legend.addStretch(1)
+            donut_body.addLayout(legend, 1)
+            cl.addLayout(donut_body, 1)
+        charts.addWidget(cat_panel, 2)
+        lay.addLayout(charts, 1)
+
+        # Desglose de retenciones e IVA con barras
         det = QFrame(); det.setObjectName("sectionPanel")
-        dl = QVBoxLayout(det); dl.setContentsMargins(16, 12, 16, 12); dl.setSpacing(4)
-        dt = QLabel("DESGLOSE DE RETENCIONES E IVA"); dt.setObjectName("eyebrow"); dl.addWidget(dt)
-        dl.addWidget(QLabel(f"ReteFuente: {_rt_money(d['retefuente'])}   ·   IVA: {_rt_money(d['iva'])}   ·   "
-                            f"ReteIVA: {_rt_money(d['reteiva'])}   ·   ReteICA: {_rt_money(d['reteica'])}"))
-        dl.addWidget(QLabel(f"Ingresos: {d['num_ingresos']}   ·   Egresos: {d['num_egresos']}"))
+        dl = QVBoxLayout(det); dl.setContentsMargins(16, 12, 16, 12); dl.setSpacing(8)
+        dl.addWidget(self._eyebrow("DESGLOSE DE RETENCIONES E IVA"))
+        conceptos = [("ReteFuente", d["retefuente"]), ("IVA", d["iva"]),
+                     ("ReteIVA", d["reteiva"]), ("ReteICA", d["reteica"])]
+        max_ret = max([v for _, v in conceptos] + [0])
+        ret_row = QHBoxLayout(); ret_row.setSpacing(18)
+        for nombre, valor in conceptos:
+            cell = QVBoxLayout(); cell.setSpacing(3)
+            head = QHBoxLayout()
+            n = QLabel(nombre); n.setStyleSheet("color: #6b7280; font-size: 11px; font-weight: 700;")
+            head.addWidget(n, 1)
+            v = QLabel(_rt_money(valor))
+            v.setStyleSheet(f"color: {colores['primario_oscuro']}; font-size: 12px; font-weight: 800;")
+            head.addWidget(v)
+            cell.addLayout(head)
+            cell.addWidget(_CbMiniBar(valor / max_ret if max_ret else 0, colores["acento"]))
+            ret_row.addLayout(cell, 1)
+        dl.addLayout(ret_row)
         lay.addWidget(det)
 
-        # Por categoría
-        cat_panel = QFrame(); cat_panel.setObjectName("sectionPanel")
-        cl = QVBoxLayout(cat_panel); cl.setContentsMargins(16, 12, 16, 12); cl.setSpacing(6)
-        cl.addWidget(self._eyebrow("POR CATEGORÍA"))
-        if not d["por_categoria"]:
-            cl.addWidget(self._muted("Sin movimientos en el período."))
-        for r in d["por_categoria"]:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(f"{_cb_cat_label(r['categoria'])}  ({_CB_TIPO_LABEL.get(r['tipo'], r['tipo'])})"), 1)
-            val = QLabel(_rt_money(r["total"])); val.setObjectName("rtConsSub"); row.addWidget(val)
-            cl.addLayout(row)
-        lay.addWidget(cat_panel)
-        lay.addStretch(1)
+    def _series_for_period(self, rango):
+        """Agrega ingresos/egresos por día (semana/mes) o por mes (año)."""
+        from datetime import date as _date, timedelta as _td
+        movs = self.store.cb_list_movimientos(fecha_ini=rango[0], fecha_fin=rango[1], limit=100000)
+        if self._periodo == "anio":
+            labels = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+            ing = [0.0] * 12; egr = [0.0] * 12
+            for m in movs:
+                try:
+                    mes = int((m["fecha"] or "")[5:7]) - 1
+                except ValueError:
+                    continue
+                if 0 <= mes < 12:
+                    (ing if m["tipo"] == "ingreso" else egr)[mes] += float(m["monto"] or 0)
+            return labels, ing, egr
+        try:
+            ini = _date.fromisoformat(rango[0]); fin = _date.fromisoformat(rango[1])
+        except ValueError:
+            return [], [], []
+        days = []
+        cursor = ini
+        while cursor <= fin and len(days) < 62:
+            days.append(cursor); cursor += _td(days=1)
+        dias_semana = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        if self._periodo == "semana":
+            labels = [dias_semana[dd.weekday()] for dd in days]
+        else:
+            labels = [str(dd.day) for dd in days]
+        idx = {dd.isoformat(): i for i, dd in enumerate(days)}
+        ing = [0.0] * len(days); egr = [0.0] * len(days)
+        for m in movs:
+            i = idx.get((m["fecha"] or "")[:10])
+            if i is None:
+                continue
+            (ing if m["tipo"] == "ingreso" else egr)[i] += float(m["monto"] or 0)
+        return labels, ing, egr
 
     def _on_periodo(self):
         self._periodo = self.periodo_combo.currentData() or "mes"
@@ -5221,7 +5968,7 @@ class DesktopShell(QMainWindow):
         self.user_avatar_label.setText(initial)
         info = self.store.db_info()
         self.footer_right.setText(info["path"])
-        self._apply_role_visibility(role)
+        self._apply_access_control(role)
         self.stack.setCurrentWidget(self.app_view)
         # Aterriza en el primer módulo permitido (dashboard si está disponible)
         landing = "dashboard" if "dashboard" in self._allowed_sections else next(iter(self._allowed_sections), None)
@@ -5249,10 +5996,17 @@ class DesktopShell(QMainWindow):
         self.scanner.set_enabled(False)
         self.stack.setCurrentWidget(self.login_view)
 
-    def _apply_role_visibility(self, role: str):
-        """Muestra solo los módulos permitidos para el rol (espejo de security.py).
-        Oculta botones de nav y etiquetas de sección que queden vacías."""
-        allowed = modules_for_role(role)
+    def _apply_access_control(self, role: str):
+        """Muestra solo los módulos permitidos por ROL ∩ PLAN del tenant.
+        El rol es espejo de security.py; el plan viene de los flags cacheados
+        de cliente_config (vía /sync/config). Sin flags cacheados => solo rol
+        (fail-open). Oculta botones de nav y etiquetas de sección vacías."""
+        role_allowed = modules_for_role(role)
+        tenant_allowed = tenant_allowed_modules(self.store.get_tenant_modules())
+        if tenant_allowed is None:
+            allowed = set(role_allowed)                       # sin restricción de plan
+        else:
+            allowed = set(role_allowed) & tenant_allowed      # tenant_allowed ya incluye SYSTEM_MODULES
         self._allowed_sections = allowed
         for key, button in self.nav_buttons.items():
             button.setVisible(key in allowed)
@@ -5267,9 +6021,10 @@ class DesktopShell(QMainWindow):
             return
         if name not in self.pages:
             return
-        # Control de acceso por rol: ignora navegación a módulos no permitidos
+        # Control de acceso (rol ∩ plan): ignora navegación a módulos no permitidos
         if name not in getattr(self, "_allowed_sections", set()):
             return
+        self._current_section = name
         self._refresh_page(name)
         self.content_stack.setCurrentWidget(self.pages[name])
         for key, button in self.nav_buttons.items():
@@ -5286,6 +6041,16 @@ class DesktopShell(QMainWindow):
     def _refresh_shared_pages(self):
         for name in ("dashboard", "products", "pos", "restaurant", "contabilidad", "inventory", "sales", "users", "sync"):
             self._refresh_page(name)
+        # Tras un sync pueden haber cambiado los flags de módulos del plan:
+        # re-aplica el gating sin requerir re-login. Si el módulo actualmente
+        # visible quedó fuera del plan, rebota a un módulo permitido.
+        if getattr(self, "user", None) is not None:
+            self._apply_access_control((self.user.role or "—").strip())
+            current = getattr(self, "_current_section", None)
+            if current and current not in self._allowed_sections:
+                landing = "dashboard" if "dashboard" in self._allowed_sections else next(iter(self._allowed_sections), None)
+                if landing:
+                    self._show_section(landing)
 
     def _refresh_page(self, name):
         page = self.pages.get(name)
@@ -5385,12 +6150,13 @@ class DesktopShell(QMainWindow):
 
     # ── Auto-update: check de versión disponible ──
     def _check_for_updates(self):
-        """Llama /api/v1/sync/version. Si hay versión nueva, muestra diálogo.
-
+        """Chequea /api/v1/sync/version. Dos modos:
+          - OBLIGATORIO (seguridad): si APP_VERSION < min_required, fuerza la
+            actualización SIN importar el toggle de auto-update ni el 'saltar'.
+          - OPCIONAL: si hay 'latest' más nueva, el auto-update está activo y no
+            fue saltada, ofrece actualizar.
         Best-effort: si no hay red, ignora.
         """
-        if not install_conf.auto_update_enabled(self._install_conf):
-            return
         state = sync_cfg.load(self._app_dir)
         base_url = state.get("base_url") or self._install_conf.get("SERVER_URL", "")
         api_key = state.get("api_key") or self._install_conf.get("SYNC_API_KEY", "")
@@ -5402,45 +6168,83 @@ class DesktopShell(QMainWindow):
         except (ValueError, SyncError):
             return
         latest = (manifest.get("latest") or "").strip()
+        min_required = (manifest.get("min_required") or "").strip()
+
+        # 1) Parche OBLIGATORIO de seguridad: no se puede saltar ni desactivar.
+        if min_required and _version_cmp(APP_VERSION, min_required) < 0:
+            self._show_update_dialog(manifest, mandatory=True)
+            return
+
+        # 2) Actualización opcional (respeta el toggle y el 'saltar esta versión').
+        if not install_conf.auto_update_enabled(self._install_conf):
+            return
         if not latest or _version_cmp(latest, APP_VERSION) <= 0:
             return  # ya estamos al día
         if latest == self._update_skip_version:
             return  # el usuario eligió saltar esta versión
-        self._show_update_dialog(manifest)
+        self._show_update_dialog(manifest, mandatory=False)
 
-    def _show_update_dialog(self, manifest):
+    def _show_update_dialog(self, manifest, mandatory=False):
         latest = manifest.get("latest", "?")
         notes = (manifest.get("release_notes") or "").strip()
-        download_url = manifest.get("download_url") or ""
-        text = (
-            f"Hay una versión nueva del POS Desktop disponible.\n\n"
-            f"Versión actual: {APP_VERSION}\n"
-            f"Versión nueva:  {latest}\n\n"
-            f"{notes if notes else 'Notas de versión no disponibles.'}\n\n"
-            f"¿Descargar e instalar ahora?"
-        )
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Actualización disponible")
-        msg.setText(text)
-        msg.setIcon(QMessageBox.Icon.Information)
-        btn_download = msg.addButton("Descargar e instalar", QMessageBox.ButtonRole.AcceptRole)
-        btn_later = msg.addButton("Más tarde", QMessageBox.ButtonRole.RejectRole)
-        btn_skip = msg.addButton("Saltar esta versión", QMessageBox.ButtonRole.DestructiveRole)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if clicked is btn_skip:
-            sync_cfg.update(self._app_dir, skip_version=latest)
-            self._update_skip_version = latest
-        elif clicked is btn_download and download_url:
-            self._download_and_launch_installer(download_url)
-        # btn_later → no hacer nada, vuelve a aparecer al próximo arranque
+        while True:
+            if mandatory:
+                text = (
+                    "Hay una actualización de SEGURIDAD obligatoria del POS Desktop.\n\n"
+                    f"Versión actual:    {APP_VERSION}\n"
+                    f"Versión requerida: {manifest.get('min_required', latest)}\n\n"
+                    f"{notes if notes else 'Actualización crítica de seguridad.'}\n\n"
+                    "Debes actualizar para seguir usando la aplicación."
+                )
+            else:
+                text = (
+                    "Hay una versión nueva del POS Desktop disponible.\n\n"
+                    f"Versión actual: {APP_VERSION}\n"
+                    f"Versión nueva:  {latest}\n\n"
+                    f"{notes if notes else 'Notas de versión no disponibles.'}\n\n"
+                    "¿Descargar e instalar ahora?"
+                )
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Actualización de seguridad" if mandatory else "Actualización disponible")
+            msg.setText(text)
+            msg.setIcon(QMessageBox.Icon.Warning if mandatory else QMessageBox.Icon.Information)
+            btn_download = msg.addButton("Descargar e instalar", QMessageBox.ButtonRole.AcceptRole)
+            btn_exit = btn_later = btn_skip = None
+            if mandatory:
+                btn_exit = msg.addButton("Salir", QMessageBox.ButtonRole.RejectRole)
+            else:
+                btn_later = msg.addButton("Más tarde", QMessageBox.ButtonRole.RejectRole)
+                btn_skip = msg.addButton("Saltar esta versión", QMessageBox.ButtonRole.DestructiveRole)
+            msg.exec()
+            clicked = msg.clickedButton()
 
-    def _download_and_launch_installer(self, url):
-        """Descarga el instalador a temp y lo ejecuta. Cierra esta app para
-        permitir reemplazo de archivos."""
-        import os
+            if clicked is btn_download:
+                if self._download_and_launch_installer(manifest):
+                    return  # instalador lanzado; la app se está cerrando
+                if mandatory:
+                    continue  # falló: re-mostrar (no puede seguir con versión insegura)
+                return
+            # No eligió descargar:
+            if mandatory:
+                QApplication.quit()  # no puede usar una versión insegura/obsoleta
+                return
+            if clicked is btn_skip:
+                sync_cfg.update(self._app_dir, skip_version=latest)
+                self._update_skip_version = latest
+            return  # 'Más tarde' o cerrar → vuelve a aparecer al próximo arranque
+
+    def _download_and_launch_installer(self, manifest):
+        """Descarga el instalador, VERIFICA su checksum SHA-256 y lo ejecuta.
+        Cierra esta app para permitir el reemplazo de archivos.
+        Devuelve True si lo lanzó (la app se cerrará), False si falló."""
+        import hashlib
         import subprocess
         import tempfile
+        url = (manifest.get("download_url") or "").strip()
+        if not url:
+            QMessageBox.warning(self, "Sin descarga", "El manifiesto de versión no trae 'download_url'.")
+            return False
+        expected = (manifest.get("checksum_sha256") or "").strip().lower()
         state = sync_cfg.load(self._app_dir)
         client = SyncClient(state.get("base_url") or self._install_conf.get("SERVER_URL", ""),
                             state.get("api_key") or "x")
@@ -5449,13 +6253,39 @@ class DesktopShell(QMainWindow):
             client.download_file(url, dest)
         except SyncError as exc:
             QMessageBox.warning(self, "Descarga fallida", f"No se pudo descargar la actualización:\n{exc}")
-            return
+            return False
+
+        # Verificación de integridad (anti-manipulación). Si el manifiesto trae
+        # checksum y NO coincide, se aborta y se borra el archivo descargado.
+        if expected:
+            h = hashlib.sha256()
+            try:
+                with open(dest, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+            except OSError as exc:
+                QMessageBox.warning(self, "Error", f"No se pudo leer el instalador descargado:\n{exc}")
+                return False
+            actual = h.hexdigest().lower()
+            if actual != expected:
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                QMessageBox.critical(
+                    self, "Actualización rechazada",
+                    "El instalador descargado NO coincide con la firma esperada "
+                    "(checksum SHA-256). Se canceló por seguridad.\n\n"
+                    f"esperado: {expected[:16]}…\nobtenido: {actual[:16]}…")
+                return False
+
         try:
             subprocess.Popen([str(dest)], close_fds=True)
         except OSError as exc:
             QMessageBox.warning(self, "Error", f"No se pudo iniciar el instalador:\n{exc}")
-            return
+            return False
         QApplication.quit()
+        return True
 
 
 # =============================================================================

@@ -217,6 +217,35 @@ class LocalStore:
             "today_sales": float(today_sales or 0),
         }
 
+    def dashboard_extras(self):
+        """Series para los mini-gráficos del dashboard: ventas de los últimos
+        7 días, top de productos vendidos (30 días) y salud del stock."""
+        hoy = date.today()
+        dias = [hoy - timedelta(days=i) for i in range(6, -1, -1)]
+        with self.connect() as conn:
+            ventas = {r["d"]: (float(r["t"]), int(r["c"])) for r in conn.execute(
+                """SELECT date(created_at) d, COALESCE(SUM(total),0) t, COUNT(*) c
+                   FROM sales WHERE date(created_at) >= date('now', 'localtime', '-6 days')
+                   GROUP BY date(created_at)""")}
+            top = [dict(r) for r in conn.execute(
+                """SELECT p.name AS name, COALESCE(SUM(si.quantity),0) AS unidades,
+                          COALESCE(SUM(si.line_total),0) AS total
+                   FROM sale_items si
+                   JOIN sales s ON s.id = si.sale_id
+                   JOIN products p ON p.id = si.product_id
+                   WHERE date(s.created_at) >= date('now', 'localtime', '-29 days')
+                   GROUP BY si.product_id ORDER BY unidades DESC LIMIT 4""")]
+            stock_ok = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE active = 1 AND stock > min_stock").fetchone()[0]
+            stock_low = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE active = 1 AND stock <= min_stock").fetchone()[0]
+        return {
+            "ventas_7d": [(d.isoformat(), *ventas.get(d.isoformat(), (0.0, 0))) for d in dias],
+            "top_products": top,
+            "stock_ok": int(stock_ok),
+            "stock_low": int(stock_low),
+        }
+
     def products(self):
         with self.connect() as conn:
             rows = conn.execute(
@@ -1975,6 +2004,24 @@ class LocalStore:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def get_tenant_modules(self):
+        """Flags de módulos del plan cacheados (config_key web -> bool).
+        Devuelve None si nunca se cachearon (el caller hace fail-open)."""
+        with self.connect() as conn:
+            raw = self._get_meta(conn, "tenant_modules")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    def set_tenant_modules(self, flags: dict) -> None:
+        """Persiste los flags de módulos del plan para gating offline."""
+        with self.connect() as conn:
+            self._set_meta(conn, "tenant_modules", json.dumps(flags, ensure_ascii=True))
 
     def _get_meta(self, conn, key, default=None):
         row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
