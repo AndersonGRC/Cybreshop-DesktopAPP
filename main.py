@@ -60,7 +60,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.0.2"
+APP_VERSION = "1.0.0.3"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
@@ -2902,6 +2902,7 @@ class SalesPage(QWidget):
         )
         self.remote_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.remote_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.remote_table.verticalHeader().setDefaultSectionSize(44)
         self.remote_table.setAlternatingRowColors(True)
         remote_layout.addWidget(self.remote_table)
         remote_hint = QLabel(
@@ -5588,6 +5589,7 @@ class ContabilidadPage(QWidget):
         self.mov_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.mov_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.mov_table.verticalHeader().setVisible(False)
+        self.mov_table.verticalHeader().setDefaultSectionSize(44)
         lay.addWidget(self.mov_table, 1)
         self._render_mov_table()
 
@@ -5667,6 +5669,7 @@ class ContabilidadPage(QWidget):
         self.pla_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.pla_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.pla_table.verticalHeader().setVisible(False)
+        self.pla_table.verticalHeader().setDefaultSectionSize(44)
         lay.addWidget(self.pla_table, 1)
         rows = self.store.cb_list_plantillas()
         self.pla_table.setRowCount(len(rows))
@@ -5728,6 +5731,7 @@ class ContabilidadPage(QWidget):
         self.cie_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.cie_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.cie_table.verticalHeader().setVisible(False)
+        self.cie_table.verticalHeader().setDefaultSectionSize(44)
         lay.addWidget(self.cie_table, 1)
         rows = self.store.cb_list_cierres()
         self.cie_table.setRowCount(len(rows))
