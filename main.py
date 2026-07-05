@@ -8333,6 +8333,11 @@ class DesktopShell(QMainWindow):
         # User card
         self.user_card = QFrame()
         self.user_card.setObjectName("userCard")
+        # UX: clic en la tarjeta de usuario → "Tu acceso" (qué módulos puede
+        # usar este rol y hasta dónde llega, según lo configuró el dueño).
+        self.user_card.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.user_card.setToolTip("Haz clic para ver tu acceso")
+        self.user_card.mousePressEvent = lambda _ev: self._mostrar_mi_acceso()
         user_outer = QHBoxLayout(self.user_card)
         user_outer.setContentsMargins(12, 10, 12, 10)
         user_outer.setSpacing(10)
@@ -8531,6 +8536,45 @@ class DesktopShell(QMainWindow):
         if actions is None:
             return True
         return action in actions
+
+    def _mostrar_mi_acceso(self):
+        """Diálogo 'Tu acceso': qué módulos puede usar el rol actual y hasta
+        dónde llega cada uno, en lenguaje simple. Refleja lo que el dueño
+        configuró en la web (Roles y Permisos) intersectado con el plan."""
+        if self.user is None:
+            return
+        allowed = getattr(self, "_allowed_sections", set())
+        etiquetas = {k: (icon, label) for k, icon, label, _sc, _sec in self.NAV_ITEMS}
+        lineas = []
+        for key, icon, label, _sc, _sec in self.NAV_ITEMS:
+            if key not in allowed or key in ("sync", "config", "dashboard"):
+                continue
+            acts = ((self._perms or {}).get("actions") or {}).get(key)
+            if acts is None:
+                nivel = "acceso completo"
+            else:
+                partes = []
+                if "view" in acts:
+                    partes.append("ver")
+                if any(a in acts for a in ("create", "edit", "use", "charge")):
+                    partes.append("crear y modificar")
+                if any(a in acts for a in ("delete", "cancel", "approve")):
+                    partes.append("eliminar/anular")
+                nivel = " · ".join(partes) or "ver"
+            lineas.append(f"<tr><td style='padding:3px 12px 3px 0'><b>{icon}  {label}</b></td>"
+                          f"<td style='color:#5a7a14'>{nivel}</td></tr>")
+        rol = (self.user.role or "—").strip()
+        cuerpo = (f"<p><b>{self.user.name}</b> · rol <b>{rol}</b></p>"
+                  + ("<table>" + "".join(lineas) + "</table>" if lineas
+                     else "<p>Tu rol no tiene módulos habilitados. Habla con el dueño del negocio.</p>")
+                  + "<p style='color:#6b7280;font-size:12px'>El dueño puede cambiar esto en la web: "
+                    "Usuarios → Roles y Permisos. Los cambios llegan al sincronizar.</p>")
+        box = QMessageBox(self)
+        box.setWindowTitle("Tu acceso")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(cuerpo)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def _show_section(self, name):
         if self.stack.currentWidget() is not self.app_view:
