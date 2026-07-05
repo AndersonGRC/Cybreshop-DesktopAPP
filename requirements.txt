@@ -1,1 +1,5 @@
 PyQt6>=6.5
+reportlab>=4.0,<5
+xhtml2pdf>=0.2.16
+jinja2>=3.1
+num2words>=0.5

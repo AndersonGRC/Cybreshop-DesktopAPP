@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 
 USER_AGENT = "CyberShopDesktop/0.4 (sync-client)"
 DEFAULT_TIMEOUT = 15  # segundos
+AI_TIMEOUT = 130  # segundos — el LLM tarda; espejo de AI_TIMEOUT del servidor (120) + margen
 
 
 class SyncError(Exception):
@@ -118,6 +119,45 @@ class SyncClient:
         cierres y categorias. Snapshot (no incremental)."""
         return self._request("GET", "/api/v1/sync/contabilidad/snapshot")
 
+    def pull_quotes_snapshot(self) -> dict[str, Any]:
+        """Estado del módulo de cotizaciones: cabeceras + detalles.
+        Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/quotes/snapshot")
+
+    def pull_cobros_snapshot(self) -> dict[str, Any]:
+        """Estado del módulo de cuentas de cobro: cabeceras + detalles.
+        Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/cobros/snapshot")
+
+    def pull_crm_snapshot(self) -> dict[str, Any]:
+        """Estado del módulo CRM: contactos, actividades, tareas y oportunidades.
+        Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/crm/snapshot")
+
+    def pull_nomina_snapshot(self) -> dict[str, Any]:
+        """Estado del módulo de nómina: empleados, parámetros, períodos, detalle
+        y novedades. Snapshot (no incremental)."""
+        return self._request("GET", "/api/v1/sync/nomina/snapshot")
+
+    # ── IA (proxy autenticado por X-Sync-Key; online-only) ──────
+    def ai_estado(self) -> dict[str, Any]:
+        """Estado del asistente: {online, licenciado, modelo, motivo}.
+        Timeout corto: es solo un ping de disponibilidad."""
+        return self._request("GET", "/api/v1/sync/ai/estado", timeout=20)
+
+    def ai_chat(self, pregunta: str) -> dict[str, Any]:
+        """Pregunta al negocio. Responde con datos reales de la BD del tenant.
+        Returns: {success, respuesta?, datos?, herramienta?, error?}."""
+        return self._request("POST", "/api/v1/sync/ai/chat",
+                             body={"pregunta": pregunta}, timeout=AI_TIMEOUT)
+
+    def ai_accion(self, tipo: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Acción puntual de IA (descripcion|reescribir|seo|tags|nombre|
+        traducir|respuesta|contenido). Returns: {success, texto?, error?}."""
+        return self._request("POST", "/api/v1/sync/ai/accion",
+                             body={"tipo": tipo, "payload": payload or {}},
+                             timeout=AI_TIMEOUT)
+
     def remote_login(self, email: str, password: str) -> dict[str, Any]:
         """Valida credenciales contra la tabla `usuarios` del tenant en el VPS.
 
@@ -171,7 +211,8 @@ class SyncClient:
             raise SyncError(f"Error descargando {url}: {e.reason}") from e
 
     # ── Internals ─────────────────────────────────────────────
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
+    def _request(self, method: str, path: str, body: dict | None = None,
+                 timeout: int | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         data = None
         headers = {
@@ -185,7 +226,7 @@ class SyncClient:
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return _parse_json(resp.read(), resp.status)
         except urllib.error.HTTPError as e:
             raw = e.read() if hasattr(e, "read") else b""

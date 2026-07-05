@@ -1,9 +1,10 @@
 import shutil
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, QEvent, QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QLockFile, QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
@@ -67,11 +68,11 @@ ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 # del backend (ADMIN_FULL, ADMIN_STAFF, POS_OPERATIONAL, RESTAURANT_*…).
 # Claves = keys de NAV_ITEMS.
 ROLE_MODULES = {
-    "Administrador": {"dashboard", "pos", "restaurant", "sales", "products", "inventory", "contabilidad", "users", "sync", "config"},
-    "Empleado":      {"dashboard", "pos", "restaurant", "sales", "products", "inventory"},
+    "Administrador": {"dashboard", "pos", "restaurant", "sales", "products", "inventory", "contabilidad", "quotes", "cobros", "crm", "payroll", "ia", "users", "sync", "config"},
+    "Empleado":      {"dashboard", "pos", "restaurant", "sales", "products", "inventory", "quotes", "crm", "ia"},
     "Cajero":        {"dashboard", "pos", "restaurant", "sales"},
     "Mesero":        {"dashboard", "pos", "restaurant"},
-    "Contador":      {"dashboard", "sales", "contabilidad"},
+    "Contador":      {"dashboard", "sales", "contabilidad", "cobros", "payroll"},
     "Cliente":       {"dashboard"},               # no debería operar el POS
     # Compatibilidad con el mapeo viejo
     "Inventario":    {"dashboard", "products", "inventory", "sales"},
@@ -91,6 +92,11 @@ TENANT_MODULE_MAP = {
     "inventory":    "inventario_habilitado",
     "contabilidad": "contabilidad_habilitada",
     "users":        "usuarios_habilitado",
+    "quotes":       "cotizaciones_habilitado",
+    "cobros":       "cuentas_cobro_habilitado",
+    "crm":          "crm_habilitado",
+    "payroll":      "nomina_habilitada",
+    "ia":           "ia_habilitado",
 }
 # Módulos de sistema: nunca dependen del plan (el usuario debe poder
 # sincronizar/configurar para des-restringirse a sí mismo).
@@ -153,6 +159,41 @@ def _version_cmp(a: str, b: str) -> int:
 def _now_iso_local() -> str:
     from datetime import datetime
     return datetime.now().isoformat(timespec="seconds")
+
+
+class _BgWorker(QThread):
+    """Ejecuta una función (llamada de red) en un hilo aparte para no congelar
+    la UI. Emite `done(objeto)` en éxito o `failed(str)` en error. Reutilizable
+    para IA (respuestas del LLM tardan) y para el sync bidireccional."""
+
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+        except Exception as exc:  # noqa: BLE001 — se propaga a la UI vía señal
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(result)
+
+
+def _ai_build_client():
+    """Construye un SyncClient desde sync_config para hablar con la IA (proxy).
+    Devuelve None si el sync no está configurado (sin URL/API key)."""
+    state = sync_cfg.load(app_data_dir())
+    base_url = state.get("base_url", "")
+    api_key = state.get("api_key", "")
+    if not base_url or not api_key:
+        return None
+    try:
+        return SyncClient(base_url, api_key)
+    except ValueError:
+        return None
 
 
 # =============================================================================
@@ -1862,10 +1903,11 @@ class DashboardPage(QWidget):
 # Productos
 # =============================================================================
 class ProductsPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed):
+    def __init__(self, store: LocalStore, on_changed, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
+        self.can = can_callback or (lambda m, a: True)
         self.selected_id = None
         self._all_products = []
         self._build()
@@ -1980,6 +2022,10 @@ class ProductsPage(QWidget):
         self.delete_btn = QPushButton("⊘  Desactivar")
         self.delete_btn.setObjectName("dangerAction")
         self.delete_btn.clicked.connect(self._delete)
+        # Eliminar catálogo = solo Admin/Propietario (CATALOG_DELETE). El resto de
+        # roles operativos puede crear/editar pero no eliminar.
+        self.delete_btn.setVisible(self.can("products", "delete"))
+        self.save_btn.setVisible(self.can("products", "create") or self.can("products", "edit"))
         actions.addWidget(self.save_btn)
         actions.addWidget(self.new_btn)
         actions.addWidget(self.delete_btn)
@@ -2267,10 +2313,11 @@ class ProductsPage(QWidget):
 # Inventario
 # =============================================================================
 class InventoryPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed):
+    def __init__(self, store: LocalStore, on_changed, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
+        self.can = can_callback or (lambda m, a: True)
         self._build()
 
     def _build(self):
@@ -2400,6 +2447,18 @@ class ScannerEngine(QObject):
         text = key_event.text()
         key = key_event.key()
 
+        # Si el foco está en el campo de barras del POS, dejamos que el QLineEdit
+        # maneje TODO nativamente (cada tecla una vez + returnPressed ->
+        # _handle_barcode_input). NO bufferizamos en paralelo: hacerlo provocaba
+        # códigos corruptos (un carácter de más / duplicado) al mezclarse el
+        # contenido del campo con el del buffer. El escáner global (buffer) queda
+        # solo para cuando el foco NO está en el campo.
+        focused = QApplication.focusWidget()
+        if focused is not None and focused.objectName() == "barcodeInput":
+            self.buffer = ""
+            self._silence_timer.stop()
+            return False
+
         if key in (Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab):
             if len(self.buffer) >= self.MIN_LENGTH:
                 self._silence_timer.stop()
@@ -2429,12 +2488,8 @@ class ScannerEngine(QObject):
 
         self.buffer += text
         self._silence_timer.start(self.SILENCE_MS)
-
-        focused = QApplication.focusWidget()
-        is_target_input = bool(focused and focused.objectName() == "barcodeInput")
-        if is_target_input:
-            return False
-
+        # Foco fuera del campo: consumimos las teclas del escaneo para que no se
+        # disparen en otros widgets; el _flush enruta el código al carrito.
         if len(self.buffer) >= 2:
             return True
         return False
@@ -2458,10 +2513,11 @@ class ScannerEngine(QObject):
 # POS
 # =============================================================================
 class PosPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed, scanner: "ScannerEngine | None" = None, brand_callback=None):
+    def __init__(self, store: LocalStore, on_changed, scanner: "ScannerEngine | None" = None, brand_callback=None, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
+        self.can = can_callback or (lambda m, a: True)
         self.cart = []
         self.scanner = scanner
         self._is_active = False
@@ -2662,11 +2718,15 @@ class PosPage(QWidget):
 
         existing = next((item for item in self.cart if item["product_id"] == product["id"]), None)
         already_in_cart = existing["quantity"] if existing else 0
-        if int(product["stock"]) - already_in_cart <= 0:
+        available = int(product["stock"])
+        # Control de inventario: no permitir agregar más de lo disponible.
+        if already_in_cart + 1 > available:
             QApplication.beep()
-            self._notify(f"Sin stock disponible para {product['name']}.", error=True)
+            self._notify(
+                f"Sin stock suficiente para {product['name']} (disponible: {available}, en carrito: {already_in_cart}).",
+                error=True,
+            )
             return
-
         if existing:
             existing["quantity"] += 1
         else:
@@ -2676,6 +2736,7 @@ class PosPage(QWidget):
                     "name": product["name"],
                     "quantity": 1,
                     "unit_price": float(product["price"]),
+                    "stock": available,
                 }
             )
         self._render_cart()
@@ -2704,6 +2765,15 @@ class PosPage(QWidget):
             return
         quantity = self.quantity.value()
         existing = next((item for item in self.cart if item["product_id"] == product["id"]), None)
+        already_in_cart = existing["quantity"] if existing else 0
+        available = int(product["stock"])
+        if already_in_cart + quantity > available:
+            QApplication.beep()
+            self._notify(
+                f"Sin stock suficiente para {product['name']} (disponible: {available}, en carrito: {already_in_cart}).",
+                error=True,
+            )
+            return
         if existing:
             existing["quantity"] += quantity
         else:
@@ -2713,6 +2783,7 @@ class PosPage(QWidget):
                     "name": product["name"],
                     "quantity": quantity,
                     "unit_price": float(product["price"]),
+                    "stock": available,
                 }
             )
         self._render_cart()
@@ -2816,6 +2887,11 @@ class PosPage(QWidget):
     def _change_qty(self, product_id, delta):
         item = next((i for i in self.cart if i["product_id"] == product_id), None)
         if item is None:
+            return
+        available = int(item.get("stock", 0))
+        if delta > 0 and item["quantity"] + delta > available:
+            QApplication.beep()
+            self._notify(f"Sin stock suficiente para {item['name']} (disponible: {available}).", error=True)
             return
         item["quantity"] += delta
         if item["quantity"] <= 0:
@@ -3031,10 +3107,11 @@ class SalesPage(QWidget):
 # Usuarios
 # =============================================================================
 class UsersPage(QWidget):
-    def __init__(self, store: LocalStore, on_changed):
+    def __init__(self, store: LocalStore, on_changed, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
+        self.can = can_callback or (lambda m, a: True)
         self._build()
 
     def _build(self):
@@ -3328,6 +3405,7 @@ class SyncPage(QWidget):
         self._base_dir = base_dir
         self._user_callback = user_callback or (lambda: None)
         self._sync_state = sync_cfg.load(base_dir)
+        self._sync_worker = None          # hilo de fondo del sync (no solapar)
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._sync_now_silent)
         self._build()
@@ -3386,15 +3464,15 @@ class SyncPage(QWidget):
         save_btn = QPushButton("Guardar configuracion")
         save_btn.setObjectName("secondaryAction")
         save_btn.clicked.connect(self._save_sync_config)
-        test_btn = QPushButton("Probar conexion")
-        test_btn.setObjectName("secondaryAction")
-        test_btn.clicked.connect(self._test_connection)
-        sync_now_btn = QPushButton("Sincronizar ahora")
-        sync_now_btn.setObjectName("primaryAction")
-        sync_now_btn.clicked.connect(self._sync_now_clicked)
+        self.test_btn = QPushButton("Probar conexion")
+        self.test_btn.setObjectName("secondaryAction")
+        self.test_btn.clicked.connect(self._test_connection)
+        self.sync_now_btn = QPushButton("Sincronizar ahora")
+        self.sync_now_btn.setObjectName("primaryAction")
+        self.sync_now_btn.clicked.connect(self._sync_now_clicked)
         actions_row.addWidget(save_btn)
-        actions_row.addWidget(test_btn)
-        actions_row.addWidget(sync_now_btn)
+        actions_row.addWidget(self.test_btn)
+        actions_row.addWidget(self.sync_now_btn)
         actions_row.addStretch(1)
         sync_form.addRow("", _wrap_layout(actions_row))
 
@@ -3430,6 +3508,11 @@ class SyncPage(QWidget):
         refresh = QPushButton("Actualizar")
         refresh.setObjectName("secondaryAction")
         refresh.clicked.connect(self.refresh)
+        full_pull = QPushButton("⭳  Forzar descarga completa de productos")
+        full_pull.setObjectName("secondaryAction")
+        full_pull.setToolTip("Reinicia el cursor y vuelve a bajar TODO el catálogo "
+                             "(recupera códigos de barras de productos nuevos)")
+        full_pull.clicked.connect(self._force_full_products)
         mark_synced = QPushButton("Marcar outbox como sincronizada")
         mark_synced.setObjectName("secondaryAction")
         mark_synced.clicked.connect(self._mark_synced)
@@ -3437,10 +3520,33 @@ class SyncPage(QWidget):
         clear_demo.setObjectName("dangerAction")
         clear_demo.clicked.connect(self._clear_demo)
         actions.addWidget(refresh)
+        actions.addWidget(full_pull)
         actions.addWidget(mark_synced)
         actions.addWidget(clear_demo)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        # Panel de operaciones RECHAZADAS por el servidor (licencia/rol).
+        # Oculto si no hay rechazos. Evita que el outbox reintente indefinidamente.
+        self.rejections_panel = QFrame()
+        self.rejections_panel.setObjectName("sectionPanel")
+        rej_layout = QVBoxLayout(self.rejections_panel)
+        rej_layout.setContentsMargins(16, 12, 16, 12); rej_layout.setSpacing(8)
+        rej_head = QHBoxLayout()
+        self.rejections_label = QLabel("")
+        self.rejections_label.setStyleSheet("color:#b42318; font-weight:800;")
+        self.rejections_label.setWordWrap(True)
+        rej_head.addWidget(self.rejections_label, 1)
+        rej_dismiss = QPushButton("Descartar avisos")
+        rej_dismiss.setObjectName("secondaryAction")
+        rej_dismiss.clicked.connect(self._dismiss_rejections)
+        rej_head.addWidget(rej_dismiss)
+        rej_layout.addLayout(rej_head)
+        self.rejections_detail = QLabel("")
+        self.rejections_detail.setObjectName("muted"); self.rejections_detail.setWordWrap(True)
+        rej_layout.addWidget(self.rejections_detail)
+        self.rejections_panel.setVisible(False)
+        layout.addWidget(self.rejections_panel)
 
         self.table = QTableWidget()
         self.table.setColumnCount(6)
@@ -3496,6 +3602,32 @@ class SyncPage(QWidget):
                 self.table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
 
         self._refresh_bidi_matrix()
+        self._refresh_rejections()
+
+    def _refresh_rejections(self):
+        """Muestra las operaciones rechazadas por el servidor (licencia/rol)."""
+        rejects = self.store.get_rejections(limit=50)
+        if not rejects:
+            self.rejections_panel.setVisible(False)
+            return
+        self.rejections_label.setText(
+            f"⚠ {len(rejects)} operación(es) rechazada(s) por el servidor"
+        )
+        # Resumen legible por motivo/entidad (máx. algunas líneas)
+        lineas = []
+        for r in rejects[:8]:
+            ent = r.get("entity") or "?"
+            acc = r.get("action") or "?"
+            motivo = (r.get("motivo") or "sin motivo").strip()
+            lineas.append(f"• {ent}/{acc}: {motivo}")
+        if len(rejects) > 8:
+            lineas.append(f"… y {len(rejects) - 8} más")
+        self.rejections_detail.setText("\n".join(lineas))
+        self.rejections_panel.setVisible(True)
+
+    def _dismiss_rejections(self):
+        self.store.clear_rejections()
+        self._refresh_rejections()
 
     def _refresh_bidi_matrix(self):
         """Pinta la matriz de bidireccionalidad por entidad. Lee los cursores
@@ -3597,34 +3729,66 @@ class SyncPage(QWidget):
         self._set_status_text(msg, error=False)
 
     def _sync_now_clicked(self):
-        try:
-            stats = self._do_sync()
-        except (ValueError, SyncError) as exc:
-            self._record_status(f"error: {exc}")
-            self._set_status_text(f"Sync fallo: {exc}", error=True)
-            return
-        msg = self._format_stats(stats)
-        suffix = ""
-        if stats["pushed_errors"]:
-            suffix = f" ({stats['pushed_errors']} errores)"
-        self._record_status("ok" + suffix)
-        self._set_status_text(msg, error=stats["pushed_errors"] > 0)
-        self.refresh()
-        self.on_changed()
+        self._start_sync(silent=False)
 
     def _sync_now_silent(self):
         """Variante para timer automatico: no muestra dialogos."""
-        try:
-            stats = self._do_sync()
-            suffix = f" ({stats['pushed_errors']} errores)" if stats["pushed_errors"] else ""
-            self._record_status("ok" + suffix)
-            self.sync_status.setText(self._format_status() + " | " + self._format_stats(stats))
-            self.refresh()
-            self.on_changed()
-        except (ValueError, SyncError) as exc:
-            self._record_status(f"error: {str(exc)[:120]}")
+        self._start_sync(silent=True)
+
+    def _start_sync(self, silent: bool):
+        """Lanza el sync bidireccional en un hilo de fondo (no congela la UI).
+        No solapa ejecuciones: si ya hay un sync corriendo, ignora la petición."""
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
+        if not self._sync_state.get("base_url") or not self._sync_state.get("api_key"):
+            if not silent:
+                self._set_status_text("Configura la URL y la API key primero.", error=True)
+            return
+        self._set_syncing_ui(True)
+        self._sync_worker = _BgWorker(lambda: self._do_sync(), self)
+        self._sync_worker.done.connect(lambda stats: self._on_sync_done(stats, silent))
+        self._sync_worker.failed.connect(lambda msg: self._on_sync_failed(msg, silent))
+        self._sync_worker.start()
+
+    def _on_sync_done(self, stats, silent: bool):
+        self._set_syncing_ui(False)
+        suffix = f" ({stats['pushed_errors']} errores)" if stats.get("pushed_errors") else ""
+        self._record_status("ok" + suffix)
+        msg = self._format_stats(stats)
+        if silent:
+            self.sync_status.setText(self._format_status() + " | " + msg)
+            self.sync_status.setStyleSheet("")
+        else:
+            self._set_status_text(msg, error=stats.get("pushed_errors", 0) > 0)
+        self.refresh()
+        self.on_changed()
+
+    def _on_sync_failed(self, msg, silent: bool):
+        self._set_syncing_ui(False)
+        self._record_status(f"error: {str(msg)[:120]}")
+        if silent:
             self.sync_status.setText(self._format_status())
             self.sync_status.setStyleSheet("color: #b42318;")
+        else:
+            self._set_status_text(f"Sync fallo: {msg}", error=True)
+
+    def _set_syncing_ui(self, busy: bool):
+        """Deshabilita los botones de sync mientras corre en segundo plano."""
+        self.sync_now_btn.setEnabled(not busy)
+        self.test_btn.setEnabled(not busy)
+        self.sync_now_btn.setText("Sincronizando…" if busy else "Sincronizar ahora")
+
+    def _force_full_products(self):
+        """Reinicia el cursor de productos y dispara un sync: baja TODO el catálogo
+        (recupera códigos de barras de altas recientes en la web)."""
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            QMessageBox.information(self, "Sincronización", "Ya hay un sync en curso; espera a que termine.")
+            return
+        sync_cfg.update(self._base_dir, cursor_products="", last_pull_at="")
+        self._sync_state["cursor_products"] = ""
+        self._sync_state["last_pull_at"] = ""
+        self._set_status_text("Descargando catálogo completo…", error=False)
+        self._start_sync(silent=False)
 
     def _format_stats(self, stats):
         pulled_total = (stats["pulled_products"] + stats["pulled_users"] +
@@ -3636,6 +3800,8 @@ class SyncPage(QWidget):
         ]
         if stats["pushed_stale"]:
             parts.append(f"{stats['pushed_stale']} descartados (server tenia version mas nueva)")
+        if stats.get("pushed_forbidden"):
+            parts.append(f"{stats['pushed_forbidden']} rechazados (licencia/rol)")
         if stats["pushed_errors"]:
             parts.append(f"{stats['pushed_errors']} errores")
         return ", ".join(parts)
@@ -3656,9 +3822,9 @@ class SyncPage(QWidget):
         client = self._build_client()
         stats = {"pulled_generos": 0, "pulled_products": 0, "pulled_users": 0,
                  "pulled_sales_web": 0, "pulled_inventory_log": 0, "pulled_restaurant": 0, "pulled_contabilidad": 0,
-                 "pulled_modules": 0,
+                 "pulled_quotes": 0, "pulled_cobros": 0, "pulled_crm": 0, "pulled_nomina": 0, "pulled_modules": 0,
                  "pushed_applied": 0, "pushed_skipped": 0, "pushed_stale": 0,
-                 "pushed_errors": 0}
+                 "pushed_forbidden": 0, "pushed_errors": 0}
 
         # --- Pull flags de módulos del plan (gating por tenant) ---
         # Aislado en su propio try/except: nunca debe romper el sync de datos.
@@ -3668,6 +3834,9 @@ class SyncPage(QWidget):
             if isinstance(mods, dict) and mods:   # solo persistir si trae algo (no pisar caché buena con {})
                 self.store.set_tenant_modules(mods)
                 stats["pulled_modules"] = len(mods)
+            perms = cfg.get("permissions")
+            if isinstance(perms, dict) and perms:  # manifiesto rol→{modules,actions}
+                self.store.set_permissions_manifest(perms)
         except SyncError as exc:
             print(f"[sync] pull_config: {exc}")
         except Exception as exc:
@@ -3776,6 +3945,46 @@ class SyncPage(QWidget):
         except Exception as exc:  # noqa: BLE001
             print(f"[sync] contabilidad snapshot fallo: {exc}")
 
+        # --- Pull cotizaciones snapshot ---
+        try:
+            qsnap = client.pull_quotes_snapshot()
+            self.store.replace_quotes_snapshot(qsnap)
+            stats["pulled_quotes"] = len(qsnap.get("cotizaciones", []))
+        except SyncError as exc:
+            print(f"[sync] pull_quotes_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync] quotes snapshot fallo: {exc}")
+
+        # --- Pull cuentas de cobro snapshot ---
+        try:
+            ccsnap = client.pull_cobros_snapshot()
+            self.store.replace_cobros_snapshot(ccsnap)
+            stats["pulled_cobros"] = len(ccsnap.get("cuentas", []))
+        except SyncError as exc:
+            print(f"[sync] pull_cobros_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync] cobros snapshot fallo: {exc}")
+
+        # --- Pull CRM snapshot ---
+        try:
+            crmsnap = client.pull_crm_snapshot()
+            self.store.replace_crm_snapshot(crmsnap)
+            stats["pulled_crm"] = len(crmsnap.get("contactos", []))
+        except SyncError as exc:
+            print(f"[sync] pull_crm_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync] crm snapshot fallo: {exc}")
+
+        # --- Pull Nómina snapshot ---
+        try:
+            nomsnap = client.pull_nomina_snapshot()
+            self.store.replace_nomina_snapshot(nomsnap)
+            stats["pulled_nomina"] = len(nomsnap.get("empleados", []))
+        except SyncError as exc:
+            print(f"[sync] pull_nomina_snapshot: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync] nomina snapshot fallo: {exc}")
+
         # --- Push outbox ---
         pending = self.store.pending_outbox(limit=100)
         if pending:
@@ -3786,6 +3995,8 @@ class SyncPage(QWidget):
             try:
                 push_resp = client.push_outbox(push_payload)
                 done_ids = []
+                rejections = []
+                by_local = {p["id"]: p for p in pending}
                 for r in push_resp.get("results", []):
                     status = r.get("status")
                     if status == "applied":
@@ -3798,15 +4009,35 @@ class SyncPage(QWidget):
                         # LWW perdio: marcar como sync (descartar) y confiar en pull proximo
                         done_ids.append(r["local_id"])
                         stats["pushed_stale"] += 1
+                    elif status == "forbidden":
+                        # Licencia/rol: NO reintentar indefinidamente. Descartar del
+                        # outbox y registrar el motivo para mostrarlo en la UI.
+                        done_ids.append(r["local_id"])
+                        stats["pushed_forbidden"] = stats.get("pushed_forbidden", 0) + 1
+                        src = by_local.get(r["local_id"], {})
+                        rejections.append({
+                            "entity": src.get("entity"), "action": src.get("action"),
+                            "motivo": r.get("error") or "No autorizado por licencia/rol.",
+                        })
                     else:
                         stats["pushed_errors"] += 1
                 self.store.mark_outbox_synced(done_ids)
+                if rejections:
+                    self.store.record_rejections(rejections)
                 # Confía las filas de restaurante empujadas para que el próximo
                 # pull adopte la verdad del servidor sin duplicar.
                 if any(p["entity"] == "restaurant_op" for p in pending):
                     self.store.mark_restaurant_pushed()
                 if any(p["entity"] == "contabilidad_op" for p in pending):
                     self.store.mark_contabilidad_pushed()
+                if any(p["entity"] == "quote_op" for p in pending):
+                    self.store.mark_quotes_pushed()
+                if any(p["entity"] == "cobro_op" for p in pending):
+                    self.store.mark_cobros_pushed()
+                if any(p["entity"] == "crm_op" for p in pending):
+                    self.store.mark_crm_pushed()
+                if any(p["entity"] == "nomina_op" for p in pending):
+                    self.store.mark_nomina_pushed()
             except SyncError as exc:
                 print(f"[sync] push_outbox: {exc}")
                 stats["pushed_errors"] += len(pending)
@@ -4317,11 +4548,12 @@ class RestaurantPage(QWidget):
     """Atención de mesas offline-first. Espejo local de las tablas de
     producción + outbox; toda acción funciona sin internet."""
 
-    def __init__(self, store: LocalStore, on_changed, user_callback=None):
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
         self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
         self._area = None
         self._selected_table = None
         self._view_mode = None  # "operativa" | "cajero" (default por rol en el 1er refresh)
@@ -4652,6 +4884,7 @@ class RestaurantPage(QWidget):
         add_btn = QPushButton("＋  Agregar a la cuenta")
         add_btn.setObjectName("primaryAction")
         add_btn.clicked.connect(self._add_consumption)
+        add_btn.setVisible(self.can("restaurant", "create"))
         add_l.addWidget(add_btn)
         self.detail_layout.addWidget(addbox)
         self._on_prod_changed()  # estado inicial de campos libres
@@ -4662,6 +4895,7 @@ class RestaurantPage(QWidget):
         charge_btn = QPushButton(f"💳  Cobrar y cerrar  ·  {_rt_money(order.get('total_acumulado'))}")
         charge_btn.setObjectName("primaryAction")
         charge_btn.clicked.connect(self._close_table)
+        charge_btn.setVisible(self.can("restaurant", "charge"))  # RESTAURANT_CHARGE (no Empleado)
         self.detail_layout.addWidget(charge_btn)
 
         actions = QHBoxLayout()
@@ -4670,8 +4904,8 @@ class RestaurantPage(QWidget):
         bill_btn.setToolTip("Marca la mesa como 'Cuenta solicitada' (el cliente pidió la cuenta).")
         bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
         actions.addWidget(bill_btn)
-        # Cancelar cuenta: solo Administrador/Cajero (espejo de RESTAURANT_CANCEL)
-        if self._role() in ("Administrador", "Cajero"):
+        # Cancelar cuenta: RESTAURANT_CANCEL (Administrador/Cajero) — vía manifiesto
+        if self.can("restaurant", "cancel"):
             cancel_btn = QPushButton("Cancelar cuenta")
             cancel_btn.setObjectName("dangerAction")
             cancel_btn.setToolTip("Anula la cuenta sin cobrar y libera la mesa.")
@@ -4768,6 +5002,7 @@ class RestaurantPage(QWidget):
         charge_btn = QPushButton(f"💳  Cobrar y cerrar  ·  {_rt_money(order.get('total_acumulado'))}")
         charge_btn.setObjectName("primaryAction")
         charge_btn.clicked.connect(self._close_table)
+        charge_btn.setVisible(self.can("restaurant", "charge"))  # RESTAURANT_CHARGE (no Empleado)
         self.detail_layout.addWidget(charge_btn)
         bill_btn = QPushButton("Marcar 'cuenta solicitada'")
         bill_btn.setObjectName("secondaryAction")
@@ -5356,11 +5591,12 @@ class ContabilidadPage(QWidget):
     """Contabilidad offline-first: dashboard, movimientos, plantillas y cierres.
     Espejo local + outbox; sincroniza con producción."""
 
-    def __init__(self, store: LocalStore, on_changed, user_callback=None):
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
         super().__init__()
         self.store = store
         self.on_changed = on_changed
         self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
         self._periodo = "mes"
         self._build()
 
@@ -5782,6 +6018,2221 @@ class ContabilidadPage(QWidget):
 
 
 # =============================================================================
+# Cotizaciones — PDF local + página offline-first
+# =============================================================================
+_CB_ESTADO_LABEL = {"pendiente": "Pendiente", "aprobada": "Aprobada", "rechazada": "Rechazada"}
+
+
+class _NumItem(QTableWidgetItem):
+    """Celda de tabla que ordena por un valor numérico subyacente (no por texto),
+    para que la columna de Total se ordene correctamente."""
+
+    def __init__(self, text: str, value: float):
+        super().__init__(text)
+        self._value = float(value or 0)
+
+    def __lt__(self, other):
+        try:
+            return self._value < other._value
+        except AttributeError:
+            return super().__lt__(other)
+
+
+_PDF_MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+              "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def _pdf_money(valor) -> str:
+    """Replica helpers.formatear_moneda de la web (locale COP, fallback manual)."""
+    import locale as _locale
+    try:
+        return _locale.currency(float(valor or 0), symbol=True, grouping=True)
+    except Exception:
+        return f"${float(valor or 0):,.2f}"
+
+
+def _pdf_brand_colores(branding: dict) -> dict:
+    """Construye el dict `colores` que esperan las plantillas PDF de la web,
+    mezclando la marca del tenant (primario) con los defaults de Config.BRAND_COLORS."""
+    bc = (branding or {}).get("colores", {})
+    emp = (branding or {}).get("empresa", {})
+    return {
+        "primario": bc.get("primario", "#122C94"),
+        "primario_oscuro": bc.get("primario_oscuro", "#091C5A"),
+        "secundario": "#0e1b33",
+        "texto": "#333333",
+        "texto_claro": "#888888",
+        "fondo_claro": "#f9f9f9",
+        "exito": "#28a745",
+        "borde": "#000000",
+        "website": emp.get("website") or "https://cybershopcol.com",
+    }
+
+
+def _pdf_logo_path(branding: dict) -> str:
+    """Ruta local del logo para xhtml2pdf (o '' si no hay)."""
+    p = ((branding or {}).get("empresa", {}) or {}).get("logo_path") or ""
+    return p if p and Path(p).is_file() else ""
+
+
+def _pdf_link_callback(uri, rel):
+    """Resuelve rutas locales para xhtml2pdf; evita peticiones HTTP."""
+    if not uri:
+        return uri
+    if uri.startswith("file://"):
+        return uri[7:]
+    return uri
+
+
+def _render_html_pdf(template_name: str, context: dict, out_path: str) -> None:
+    """Renderiza una plantilla HTML (jinja2) y la convierte a PDF (xhtml2pdf).
+    Usa las MISMAS plantillas que la web para un diseño idéntico."""
+    import jinja2
+    from xhtml2pdf import pisa
+    tpl_dir = _asset_path("pdf_templates")
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(tpl_dir)),
+        autoescape=jinja2.select_autoescape(["html"]),
+    )
+    html = env.get_template(template_name).render(**context)
+    with open(out_path, "wb") as fh:
+        status = pisa.CreatePDF(html, dest=fh, link_callback=_pdf_link_callback)
+    if status.err:
+        raise RuntimeError("xhtml2pdf no pudo generar el PDF")
+
+
+def _quote_generate_pdf(path: str, cot: dict, items: list, branding: dict) -> None:
+    """Genera el PDF de una cotización con la MISMA plantilla de la web
+    (pdf_quote.html) — diseño idéntico, 100% local."""
+    # Desglose de totales (espejo de routes/quotes.py)
+    subtotal = descuentos = iva_total = 0.0
+    items_ctx = []
+    for it in items:
+        cant = int(it.get("cantidad") or 0)
+        precio = float(it.get("precio_unitario") or 0)
+        dpct = float(it.get("descuento_porc") or 0)
+        ipct = float(it.get("iva_porc") or 0)
+        base = cant * precio
+        md = base * (dpct / 100)
+        menos = base - md
+        miva = menos * (ipct / 100) if ipct > 0 else 0
+        subtotal += base
+        descuentos += md
+        iva_total += miva
+        items_ctx.append({
+            "imagen_local_path": None,
+            "descripcion": it.get("descripcion") or "",
+            "cantidad": cant,
+            "precio_unitario": _pdf_money(precio),
+            "subtotal": _pdf_money(it.get("subtotal")),
+        })
+    fecha = cot.get("fecha") or date.today().isoformat()
+    try:
+        d = date.fromisoformat(str(fecha)[:10])
+        fecha_txt = f"Bogotá {d.day} de {_PDF_MESES[d.month - 1]} de {d.year}"
+    except (ValueError, IndexError):
+        fecha_txt = f"Bogotá {fecha}"
+    num = cot.get("remote_id") or cot.get("local_id") or 0
+    ctx = {
+        "id": f"COT {str(num).zfill(10)}",
+        "fecha": fecha_txt,
+        "logo": _pdf_logo_path(branding),
+        "colores": _pdf_brand_colores(branding),
+        "cliente": {
+            "nombre": cot.get("cliente_nombre") or "",
+            "documento": cot.get("cliente_documento") or "",
+            "direccion": cot.get("cliente_direccion") or "",
+            "ciudad": cot.get("cliente_ciudad") or "",
+            "representante": cot.get("cliente_representante") or "",
+            "localidad": cot.get("cliente_localidad") or "",
+            "cargo": cot.get("cliente_cargo") or "",
+            "telefono": cot.get("cliente_telefono") or "",
+        },
+        "items": items_ctx,
+        "subtotal": _pdf_money(subtotal),
+        "descuento": _pdf_money(descuentos),
+        "iva": _pdf_money(iva_total),
+        "total": _pdf_money(cot.get("total")),
+    }
+    _render_html_pdf("pdf_quote.html", ctx, path)
+
+
+class _QuoteDialog(QDialog):
+    """Alta de una cotización: datos del cliente + ítems."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nueva cotización")
+        self.setMinimumWidth(640)
+        self.result_data = None
+        root = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.nombre = QLineEdit(); self.documento = QLineEdit(); self.telefono = QLineEdit()
+        self.ciudad = QLineEdit(); self.direccion = QLineEdit(); self.representante = QLineEdit()
+        form.addRow("Cliente *", self.nombre)
+        form.addRow("Documento", self.documento)
+        form.addRow("Teléfono", self.telefono)
+        form.addRow("Ciudad", self.ciudad)
+        form.addRow("Dirección", self.direccion)
+        form.addRow("Representante", self.representante)
+        root.addLayout(form)
+
+        bar = QHBoxLayout()
+        eyebrow = QLabel("ÍTEMS"); eyebrow.setObjectName("eyebrow")
+        bar.addWidget(eyebrow); bar.addStretch(1)
+        add = QPushButton("＋  Agregar ítem"); add.setObjectName("secondaryAction"); add.clicked.connect(self._add_row)
+        bar.addWidget(add)
+        root.addLayout(bar)
+
+        self.items = QTableWidget(0, 5)
+        self.items.setHorizontalHeaderLabels(["Descripción", "Cantidad", "P. Unitario", "Desc %", "IVA %"])
+        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self.items, 1)
+        self._add_row()
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _add_row(self):
+        r = self.items.rowCount(); self.items.insertRow(r)
+        self.items.setItem(r, 0, QTableWidgetItem(""))
+        for col, default in ((1, "1"), (2, "0"), (3, "0"), (4, "0")):
+            self.items.setItem(r, col, QTableWidgetItem(default))
+
+    def _accept(self):
+        if not self.nombre.text().strip():
+            QMessageBox.warning(self, "Cotización", "El nombre del cliente es obligatorio."); return
+        items = []
+        for r in range(self.items.rowCount()):
+            desc = (self.items.item(r, 0).text() if self.items.item(r, 0) else "").strip()
+            if not desc:
+                continue
+            def _num(col, cast):
+                try:
+                    return cast(self.items.item(r, col).text())
+                except (ValueError, AttributeError):
+                    return cast(0)
+            items.append({"descripcion": desc, "cantidad": _num(1, int),
+                          "precio_unitario": _num(2, float), "descuento_porc": _num(3, float),
+                          "iva_porc": _num(4, float)})
+        if not items:
+            QMessageBox.warning(self, "Cotización", "Agrega al menos un ítem con descripción."); return
+        self.result_data = {
+            "cliente": {
+                "cliente_nombre": self.nombre.text().strip(),
+                "cliente_documento": self.documento.text().strip(),
+                "cliente_telefono": self.telefono.text().strip(),
+                "cliente_ciudad": self.ciudad.text().strip(),
+                "cliente_direccion": self.direccion.text().strip(),
+                "cliente_representante": self.representante.text().strip(),
+            },
+            "items": items,
+        }
+        self.accept()
+
+
+class CotizacionesPage(QWidget):
+    """Cotizaciones offline-first: crear (PDF local), listar, aprobar/rechazar,
+    eliminar; sincroniza con producción vía outbox quote_op."""
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 18); root.setSpacing(12)
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("Cotizaciones"); title.setObjectName("pageTitle")
+        sub = QLabel("Genera cotizaciones con PDF local. Funciona sin internet; sincroniza con producción.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.sync_label = QLabel(""); self.sync_label.setObjectName("rtSyncLabel")
+        header.addWidget(self.sync_label)
+        self.nueva_btn = QPushButton("＋  Nueva cotización"); self.nueva_btn.setObjectName("primaryAction")
+        self.nueva_btn.clicked.connect(self._nueva)
+        header.addWidget(self.nueva_btn)
+        refresh = QPushButton("↻  Refrescar"); refresh.setObjectName("secondaryAction")
+        refresh.clicked.connect(self.refresh)
+        header.addWidget(refresh)
+        root.addLayout(header)
+
+        search_row = QHBoxLayout(); search_row.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("⌕  Buscar por cliente, documento o estado")
+        self.search.textChanged.connect(self._apply_filter)
+        search_row.addWidget(self.search, 1)
+        hint = QLabel("Clic en una columna para ordenar (ej. Fecha o Total)")
+        hint.setObjectName("muted")
+        search_row.addWidget(hint)
+        root.addLayout(search_row)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Fecha", "Cliente", "Total", "Estado", "PDF", ""])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(5, 290)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(46)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.DescendingOrder)  # por fecha desc por defecto
+        root.addWidget(self.table, 1)
+        self._all_rows = []
+        self.refresh()
+
+    _CELL_BTN = "min-height: 26px; padding: 0 10px; font-size: 12px;"
+
+    def refresh(self):
+        pend = self.store.q_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync"); self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado"); self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label); self.sync_label.style().polish(self.sync_label)
+        self.nueva_btn.setVisible(self.can("quotes", "create"))
+        self._all_rows = self.store.q_list_cotizaciones()
+        self._apply_filter()
+
+    def _apply_filter(self):
+        needle = self.search.text().strip().lower() if hasattr(self, "search") else ""
+        rows = [q for q in self._all_rows if not needle or needle in (
+            (q.get("cliente_nombre") or "") + " " + (q.get("cliente_documento") or "") + " " + (q.get("estado") or "")
+        ).lower()]
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for i, q in enumerate(rows):
+            self.table.setItem(i, 0, QTableWidgetItem(q["fecha"] or ""))
+            cliente = q["cliente_nombre"] + ("  ⏳" if q["synced"] == 0 else "")
+            self.table.setItem(i, 1, QTableWidgetItem(cliente))
+            self.table.setItem(i, 2, _NumItem(_rt_money(q["total"]), q["total"]))
+            self.table.setItem(i, 3, QTableWidgetItem(_CB_ESTADO_LABEL.get(q["estado"], q["estado"])))
+            pdf_btn = QPushButton("PDF"); pdf_btn.setObjectName("secondaryAction")
+            pdf_btn.setStyleSheet(self._CELL_BTN)
+            pdf_btn.clicked.connect(lambda _=False, lid=q["local_id"]: self._pdf(lid))
+            pdf_wrap = QWidget(); pw = QHBoxLayout(pdf_wrap); pw.setContentsMargins(4, 0, 4, 0)
+            pw.addWidget(pdf_btn)
+            self.table.setCellWidget(i, 4, pdf_wrap)
+            actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(4, 0, 4, 0); al.setSpacing(4)
+            if self.can("quotes", "approve") and q["estado"] == "pendiente":
+                ap = QPushButton("Aprobar"); ap.setObjectName("secondaryAction"); ap.setStyleSheet(self._CELL_BTN)
+                ap.clicked.connect(lambda _=False, lid=q["local_id"]: self._estado(lid, "aprobada"))
+                rj = QPushButton("Rechazar"); rj.setObjectName("inlineDanger"); rj.setStyleSheet(self._CELL_BTN)
+                rj.clicked.connect(lambda _=False, lid=q["local_id"]: self._estado(lid, "rechazada"))
+                al.addWidget(ap); al.addWidget(rj)
+            if self.can("quotes", "delete"):
+                dl = QPushButton("Eliminar"); dl.setObjectName("inlineDanger"); dl.setStyleSheet(self._CELL_BTN)
+                dl.clicked.connect(lambda _=False, lid=q["local_id"]: self._eliminar(lid))
+                al.addWidget(dl)
+            al.addStretch(1)
+            self.table.setCellWidget(i, 5, actions)
+        self.table.setSortingEnabled(True)
+
+    def _nueva(self):
+        if not self.can("quotes", "create"):
+            return
+        dlg = _QuoteDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            local_id = self.store.q_crear_cotizacion(dlg.result_data["cliente"], dlg.result_data["items"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cotización", str(exc)); return
+        self._after_change()
+        if QMessageBox.question(self, "Cotización", "Cotización creada. ¿Generar el PDF ahora?") == QMessageBox.StandardButton.Yes:
+            self._pdf(local_id)
+
+    def _pdf(self, local_id):
+        rows = {r["local_id"]: r for r in self.store.q_list_cotizaciones()}
+        cot = rows.get(local_id)
+        if not cot:
+            return
+        items = self.store.q_get_detalle(local_id)
+        path, _ = QFileDialog.getSaveFileName(self, "Guardar cotización PDF",
+                                              f"Cotizacion_{local_id}.pdf", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            branding = branding_mod.load_branding(app_data_dir())
+            _quote_generate_pdf(path, cot, items, branding)
+            QMessageBox.information(self, "Cotización", f"PDF generado: {path}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Cotización", f"No se pudo generar el PDF: {exc}")
+
+    def _estado(self, local_id, estado):
+        try:
+            self.store.q_set_estado(local_id, estado, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cotización", str(exc)); return
+        self._after_change()
+
+    def _eliminar(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar esta cotización?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.q_eliminar_cotizacion(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cotización", str(exc)); return
+        self._after_change()
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
+# =============================================================================
+# Cuentas de cobro — PDF local + página offline-first
+# =============================================================================
+def _cobro_generate_pdf(path: str, cuenta: dict, items: list, branding: dict) -> None:
+    """Genera el PDF de una cuenta de cobro con la MISMA plantilla de la web
+    (pdf_cuenta_cobro.html) — diseño idéntico, 100% local."""
+    total = float(cuenta.get("total") or 0)
+    try:
+        import num2words
+        total_texto = num2words.num2words(total, lang="es").upper() + " PESOS M/CTE"
+    except Exception:
+        total_texto = f"{total} PESOS M/CTE"
+    # Fecha larga + consecutivo con formato de la web (dd-mm-yyyy-id)
+    fecha = cuenta.get("fecha") or date.today().isoformat()
+    meses_cap = [m.capitalize() for m in _PDF_MESES]
+    num = cuenta.get("remote_id") or cuenta.get("local_id") or 0
+    try:
+        d = date.fromisoformat(str(fecha)[:10])
+        fecha_larga = f"{d.day} de {meses_cap[d.month - 1]} de {d.year}"
+        consecutivo = f"{d.day:02d}-{d.month:02d}-{d.year}-{num}"
+    except (ValueError, IndexError):
+        fecha_larga = str(fecha)
+        consecutivo = cuenta.get("consecutivo") or f"CDC-{num}"
+    items_ctx = [{
+        "fecha": it.get("fecha_labor") or "",
+        "descripcion": it.get("descripcion") or "",
+        "valor_formatted": _pdf_money(it.get("valor")),
+    } for it in items]
+    emp = (branding or {}).get("empresa", {})
+    ctx = {
+        "consecutivo": consecutivo,
+        "fecha": fecha_larga,
+        "logo": _pdf_logo_path(branding),
+        "cliente": {
+            "nombre": cuenta.get("cliente_nombre") or "",
+            "nit": cuenta.get("cliente_nit") or "",
+            "direccion": cuenta.get("cliente_direccion") or "",
+            "ciudad": cuenta.get("cliente_ciudad") or "",
+        },
+        "contractor": {
+            "nombre": cuenta.get("contractor_nombre") or "",
+            "id": cuenta.get("contractor_id") or "",
+            "texto_pago": cuenta.get("texto_pago") or "",
+            "email": cuenta.get("contractor_email") or "",
+            "telefono": cuenta.get("contractor_telefono") or "",
+        },
+        "items": items_ctx,
+        "total_valor": _pdf_money(total),
+        "total_texto": total_texto,
+        "empresa_website": emp.get("website") or "https://cybershopcol.com",
+    }
+    _render_html_pdf("pdf_cuenta_cobro.html", ctx, path)
+
+
+class _CobroDialog(QDialog):
+    """Alta de una cuenta de cobro: cliente + quien cobra + ítems (labores)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nueva cuenta de cobro")
+        self.setMinimumWidth(640)
+        self.result_data = None
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.nombre = QLineEdit(); self.nit = QLineEdit(); self.telefono = QLineEdit()
+        self.ciudad = QLineEdit(); self.direccion = QLineEdit()
+        self.contractor = QLineEdit(); self.contractor_id = QLineEdit()
+        self.texto_pago = QLineEdit()
+        form.addRow("Cliente *", self.nombre)
+        form.addRow("NIT / CC", self.nit)
+        form.addRow("Teléfono", self.telefono)
+        form.addRow("Ciudad", self.ciudad)
+        form.addRow("Dirección", self.direccion)
+        form.addRow("Quien cobra", self.contractor)
+        form.addRow("Doc. quien cobra", self.contractor_id)
+        form.addRow("Texto de pago", self.texto_pago)
+        root.addLayout(form)
+        bar = QHBoxLayout()
+        eyebrow = QLabel("LABORES / ÍTEMS"); eyebrow.setObjectName("eyebrow")
+        bar.addWidget(eyebrow); bar.addStretch(1)
+        add = QPushButton("＋  Agregar ítem"); add.setObjectName("secondaryAction"); add.clicked.connect(self._add_row)
+        bar.addWidget(add)
+        root.addLayout(bar)
+        self.items = QTableWidget(0, 3)
+        self.items.setHorizontalHeaderLabels(["Fecha (YYYY-MM-DD)", "Descripción", "Valor"])
+        self.items.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self.items, 1)
+        self._add_row()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _add_row(self):
+        r = self.items.rowCount(); self.items.insertRow(r)
+        self.items.setItem(r, 0, QTableWidgetItem(QDate.currentDate().toString("yyyy-MM-dd")))
+        self.items.setItem(r, 1, QTableWidgetItem(""))
+        self.items.setItem(r, 2, QTableWidgetItem("0"))
+
+    def _accept(self):
+        if not self.nombre.text().strip():
+            QMessageBox.warning(self, "Cuenta de cobro", "El nombre del cliente es obligatorio."); return
+        items = []
+        for r in range(self.items.rowCount()):
+            desc = (self.items.item(r, 1).text() if self.items.item(r, 1) else "").strip()
+            if not desc:
+                continue
+            fecha = (self.items.item(r, 0).text() if self.items.item(r, 0) else "").strip()
+            try:
+                valor = float(self.items.item(r, 2).text())
+            except (ValueError, AttributeError):
+                valor = 0.0
+            items.append({"fecha_labor": fecha, "descripcion": desc, "valor": valor})
+        if not items:
+            QMessageBox.warning(self, "Cuenta de cobro", "Agrega al menos un ítem con descripción."); return
+        self.result_data = {
+            "cliente": {
+                "cliente_nombre": self.nombre.text().strip(), "cliente_nit": self.nit.text().strip(),
+                "cliente_telefono": self.telefono.text().strip(), "cliente_ciudad": self.ciudad.text().strip(),
+                "cliente_direccion": self.direccion.text().strip(),
+                "contractor_nombre": self.contractor.text().strip(),
+                "contractor_id": self.contractor_id.text().strip(),
+                "texto_pago": self.texto_pago.text().strip(),
+            },
+            "items": items,
+        }
+        self.accept()
+
+
+class CuentasCobroPage(QWidget):
+    """Cuentas de cobro offline-first: crear (PDF local), listar, eliminar;
+    sincroniza con producción vía outbox cobro_op."""
+
+    _CELL_BTN = "min-height: 26px; padding: 0 10px; font-size: 12px;"
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 18); root.setSpacing(12)
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("Cuentas de cobro"); title.setObjectName("pageTitle")
+        sub = QLabel("Documentos de cobro con PDF local. Funciona sin internet; sincroniza con producción.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.sync_label = QLabel(""); self.sync_label.setObjectName("rtSyncLabel")
+        header.addWidget(self.sync_label)
+        self.nueva_btn = QPushButton("＋  Nueva cuenta"); self.nueva_btn.setObjectName("primaryAction")
+        self.nueva_btn.clicked.connect(self._nueva)
+        header.addWidget(self.nueva_btn)
+        refresh = QPushButton("↻  Refrescar"); refresh.setObjectName("secondaryAction")
+        refresh.clicked.connect(self.refresh)
+        header.addWidget(refresh)
+        root.addLayout(header)
+
+        search_row = QHBoxLayout(); search_row.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("⌕  Buscar por consecutivo, cliente o quien cobra")
+        self.search.textChanged.connect(self._apply_filter)
+        search_row.addWidget(self.search, 1)
+        hint = QLabel("Clic en una columna para ordenar (ej. Fecha o Total)")
+        hint.setObjectName("muted")
+        search_row.addWidget(hint)
+        root.addLayout(search_row)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Fecha", "Consecutivo", "Cliente", "Quien cobra", "Total", "PDF", ""])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(6, 130)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(46)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.DescendingOrder)  # por fecha desc por defecto
+        root.addWidget(self.table, 1)
+        self._all_rows = []
+        self.refresh()
+
+    def refresh(self):
+        pend = self.store.cc_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync"); self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado"); self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label); self.sync_label.style().polish(self.sync_label)
+        self.nueva_btn.setVisible(self.can("cobros", "create"))
+        self._all_rows = self.store.cc_list_cuentas()
+        self._apply_filter()
+
+    def _apply_filter(self):
+        needle = self.search.text().strip().lower() if hasattr(self, "search") else ""
+        rows = [q for q in self._all_rows if not needle or needle in (
+            (q.get("consecutivo") or "") + " " + (q.get("cliente_nombre") or "") + " " + (q.get("contractor_nombre") or "")
+        ).lower()]
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for i, q in enumerate(rows):
+            self.table.setItem(i, 0, QTableWidgetItem(q["fecha"] or ""))
+            cons = (q["consecutivo"] or "") + ("  ⏳" if q["synced"] == 0 else "")
+            self.table.setItem(i, 1, QTableWidgetItem(cons))
+            self.table.setItem(i, 2, QTableWidgetItem(q["cliente_nombre"] or ""))
+            self.table.setItem(i, 3, QTableWidgetItem(q["contractor_nombre"] or ""))
+            self.table.setItem(i, 4, _NumItem(_rt_money(q["total"]), q["total"]))
+            pdf_btn = QPushButton("PDF"); pdf_btn.setObjectName("secondaryAction"); pdf_btn.setStyleSheet(self._CELL_BTN)
+            pdf_btn.clicked.connect(lambda _=False, lid=q["local_id"]: self._pdf(lid))
+            pdf_wrap = QWidget(); pw = QHBoxLayout(pdf_wrap); pw.setContentsMargins(4, 0, 4, 0); pw.addWidget(pdf_btn)
+            self.table.setCellWidget(i, 5, pdf_wrap)
+            actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(4, 0, 4, 0); al.setSpacing(4)
+            if self.can("cobros", "delete"):
+                dl = QPushButton("Eliminar"); dl.setObjectName("inlineDanger"); dl.setStyleSheet(self._CELL_BTN)
+                dl.clicked.connect(lambda _=False, lid=q["local_id"]: self._eliminar(lid))
+                al.addWidget(dl)
+            al.addStretch(1)
+            self.table.setCellWidget(i, 6, actions)
+        self.table.setSortingEnabled(True)
+
+    def _nueva(self):
+        if not self.can("cobros", "create"):
+            return
+        dlg = _CobroDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            local_id = self.store.cc_crear_cuenta(dlg.result_data["cliente"], dlg.result_data["items"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cuenta de cobro", str(exc)); return
+        self._after_change()
+        if QMessageBox.question(self, "Cuenta de cobro", "Cuenta creada. ¿Generar el PDF ahora?") == QMessageBox.StandardButton.Yes:
+            self._pdf(local_id)
+
+    def _pdf(self, local_id):
+        cuenta = self.store.cc_get_cuenta(local_id)
+        if not cuenta:
+            return
+        items = self.store.cc_get_detalle(local_id)
+        path, _ = QFileDialog.getSaveFileName(self, "Guardar cuenta de cobro PDF",
+                                              f"CuentaCobro_{cuenta.get('consecutivo') or local_id}.pdf", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            branding = branding_mod.load_branding(app_data_dir())
+            _cobro_generate_pdf(path, cuenta, items, branding)
+            QMessageBox.information(self, "Cuenta de cobro", f"PDF generado: {path}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Cuenta de cobro", f"No se pudo generar el PDF: {exc}")
+
+    def _eliminar(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar esta cuenta de cobro?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.cc_eliminar_cuenta(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cuenta de cobro", str(exc)); return
+        self._after_change()
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
+# =============================================================================
+# CRM — contactos, tareas, actividades y pipeline (offline-first)
+# =============================================================================
+_CRM_TIPOS = [("cliente", "Cliente"), ("lead", "Lead"), ("proveedor", "Proveedor"), ("socio", "Socio")]
+_CRM_TIPO_LABEL = dict(_CRM_TIPOS)
+_CRM_PRIORIDADES = [("alta", "Alta"), ("media", "Media"), ("baja", "Baja")]
+_CRM_PRIORIDAD_LABEL = dict(_CRM_PRIORIDADES)
+_CRM_ACT_TIPOS = [("llamada", "Llamada"), ("email", "Email"), ("reunion", "Reunión"),
+                  ("whatsapp", "WhatsApp"), ("visita", "Visita"), ("nota", "Nota")]
+_CRM_ETAPAS = [("prospecto", "Prospecto"), ("calificado", "Calificado"), ("propuesta", "Propuesta"),
+               ("negociacion", "Negociación"), ("ganada", "Ganada"), ("perdida", "Perdida")]
+_CRM_ETAPA_LABEL = dict(_CRM_ETAPAS)
+
+
+def _crm_tipo_color(colores, tipo):
+    return {
+        "cliente": colores["acento_secundario"], "lead": colores["acento"],
+        "proveedor": colores["primario"], "socio": colores["primario_oscuro"],
+    }.get(tipo, colores["primario"])
+
+
+def _crm_etapa_color(colores, etapa):
+    return {
+        "prospecto": colores["primario"], "calificado": colores["acento"],
+        "propuesta": colores["primario_oscuro"], "negociacion": colores["acento"],
+        "ganada": colores["acento_secundario"], "perdida": colores["peligro"],
+    }.get(etapa, colores["primario"])
+
+
+def _crm_prioridad_color(colores, prioridad):
+    return {"alta": colores["peligro"], "media": colores["acento"], "baja": colores["acento_secundario"]}.get(prioridad, colores["acento"])
+
+
+def _crm_initials(nombre: str) -> str:
+    parts = [p for p in (nombre or "").split() if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[1][0]).upper()
+
+
+def _crm_avatar(nombre: str, color: str) -> QWidget:
+    """Círculo con iniciales (estilo moderno) coloreado por la marca."""
+    ac = QColor(color)
+    wrap = QWidget()
+    h = QHBoxLayout(wrap); h.setContentsMargins(0, 0, 0, 0)
+    lbl = QLabel(_crm_initials(nombre))
+    lbl.setFixedSize(32, 32)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lbl.setStyleSheet(
+        f"background: rgba({ac.red()},{ac.green()},{ac.blue()},0.16); color: {color};"
+        f" border-radius: 16px; font-weight: 800; font-size: 12px;"
+    )
+    h.addStretch(1); h.addWidget(lbl); h.addStretch(1)
+    return wrap
+
+
+def _crm_pill(text: str, color: str) -> QWidget:
+    """Pastilla de color centrada para celda de tabla (tipo de contacto)."""
+    ac = QColor(color)
+    wrap = QWidget()
+    h = QHBoxLayout(wrap); h.setContentsMargins(4, 0, 4, 0)
+    pill = QLabel(text)
+    pill.setStyleSheet(
+        f"background: rgba({ac.red()},{ac.green()},{ac.blue()},0.14); color: {color};"
+        f" border-radius: 10px; padding: 3px 12px; font-size: 11px; font-weight: 800;"
+    )
+    h.addStretch(1); h.addWidget(pill); h.addStretch(1)
+    return wrap
+
+
+def _crm_empty_state(icon: str, titulo: str, sub: str, color: str) -> QWidget:
+    """Estado vacío amigable con ícono, para tabs sin datos."""
+    w = QFrame(); w.setObjectName("sectionPanel")
+    v = QVBoxLayout(w); v.setContentsMargins(20, 30, 20, 30); v.setSpacing(6)
+    v.addStretch(1)
+    ic = QLabel(icon); ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    ic.setStyleSheet(f"color: {color}; font-size: 40px; font-weight: 800;")
+    v.addWidget(ic)
+    t = QLabel(titulo); t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    t.setStyleSheet("font-size: 15px; font-weight: 800; color: #374151;")
+    v.addWidget(t)
+    s = QLabel(sub); s.setObjectName("muted"); s.setAlignment(Qt.AlignmentFlag.AlignCenter); s.setWordWrap(True)
+    v.addWidget(s)
+    v.addStretch(1)
+    return w
+
+
+class _CrmContactDialog(QDialog):
+    """Alta/edición de un contacto CRM."""
+
+    def __init__(self, parent, data=None, can_use_ai=False):
+        super().__init__(parent)
+        self.setWindowTitle("Editar contacto" if data else "Nuevo contacto")
+        self.setMinimumWidth(460)
+        self.result_data = None
+        self._ai_worker = None
+        data = data or {}
+        form = QFormLayout(self)
+        form.setSpacing(9)
+        self.tipo = QComboBox()
+        for v, lbl in _CRM_TIPOS:
+            self.tipo.addItem(lbl, v)
+        idx = max(0, self.tipo.findData(data.get("tipo") or "cliente"))
+        self.tipo.setCurrentIndex(idx)
+        self.nombre = QLineEdit(data.get("nombre") or "")
+        self.empresa = QLineEdit(data.get("empresa") or "")
+        self.cargo = QLineEdit(data.get("cargo") or "")
+        self.email = QLineEdit(data.get("email") or "")
+        self.telefono = QLineEdit(data.get("telefono") or "")
+        self.whatsapp = QLineEdit(data.get("whatsapp") or "")
+        self.ciudad = QLineEdit(data.get("ciudad") or "")
+        self.direccion = QLineEdit(data.get("direccion") or "")
+        self.notas = QTextEdit(data.get("notas") or ""); self.notas.setMaximumHeight(70)
+        form.addRow("Tipo *", self.tipo)
+        form.addRow("Nombre *", self.nombre)
+        form.addRow("Empresa", self.empresa)
+        form.addRow("Cargo", self.cargo)
+        form.addRow("Email", self.email)
+        form.addRow("Teléfono", self.telefono)
+        form.addRow("WhatsApp", self.whatsapp)
+        form.addRow("Ciudad", self.ciudad)
+        form.addRow("Dirección", self.direccion)
+        form.addRow("Notas", self.notas)
+        # Acción IA contextual: solo si el módulo IA está licenciado y el rol puede
+        # usarlo (can_use_ai). Genera una sugerencia de siguiente acción comercial
+        # y la coloca en Notas. Requiere conexión (se valida al pulsar).
+        if can_use_ai:
+            self.ai_btn = QPushButton("✦  Sugerir siguiente acción")
+            self.ai_btn.setObjectName("secondaryAction")
+            self.ai_btn.setToolTip("La IA propone el próximo paso comercial con este contacto")
+            self.ai_btn.clicked.connect(self._ai_sugerir)
+            form.addRow("", self.ai_btn)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _ai_sugerir(self):
+        if self._ai_worker and self._ai_worker.isRunning():
+            return
+        client = _ai_build_client()
+        if client is None:
+            QMessageBox.information(self, "Asistente IA",
+                                    "Necesitas conexión configurada para usar la IA."); return
+        contexto = (
+            f"Contacto: {self.nombre.text().strip() or '—'}. "
+            f"Empresa: {self.empresa.text().strip() or '—'}. "
+            f"Cargo: {self.cargo.text().strip() or '—'}. "
+            f"Tipo: {self.tipo.currentText()}. "
+            f"Notas actuales: {self.notas.toPlainText().strip() or 'ninguna'}."
+        )
+        payload = {"titulo": f"Siguiente acción comercial con {self.nombre.text().strip() or 'el contacto'}",
+                   "tipo": "sugerencia breve de seguimiento comercial (CRM)",
+                   "detalle": contexto}
+        self.ai_btn.setEnabled(False); self.ai_btn.setText("✦  Pensando…")
+        self._ai_worker = _BgWorker(lambda: client.ai_accion("contenido", payload), self)
+        self._ai_worker.done.connect(self._ai_sugerir_done)
+        self._ai_worker.failed.connect(lambda _m: self._ai_sugerir_fail())
+        self._ai_worker.start()
+
+    def _ai_sugerir_done(self, resp):
+        self.ai_btn.setEnabled(True); self.ai_btn.setText("✦  Sugerir siguiente acción")
+        if not isinstance(resp, dict) or not resp.get("success"):
+            QMessageBox.information(self, "Asistente IA",
+                                    (resp or {}).get("error") or "No pude generar la sugerencia."); return
+        texto = (resp.get("texto") or "").strip()
+        if not texto:
+            return
+        actual = self.notas.toPlainText().strip()
+        self.notas.setPlainText((actual + "\n\n" if actual else "") + f"✦ IA: {texto}")
+
+    def _ai_sugerir_fail(self):
+        self.ai_btn.setEnabled(True); self.ai_btn.setText("✦  Sugerir siguiente acción")
+        QMessageBox.information(self, "Asistente IA", "Sin conexión con el asistente. Intenta de nuevo.")
+
+    def _accept(self):
+        if not self.nombre.text().strip():
+            QMessageBox.warning(self, "CRM", "El nombre es obligatorio."); return
+        self.result_data = {
+            "tipo": self.tipo.currentData(), "nombre": self.nombre.text().strip(),
+            "empresa": self.empresa.text().strip(), "cargo": self.cargo.text().strip(),
+            "email": self.email.text().strip(), "telefono": self.telefono.text().strip(),
+            "whatsapp": self.whatsapp.text().strip(), "ciudad": self.ciudad.text().strip(),
+            "direccion": self.direccion.text().strip(), "notas": self.notas.toPlainText().strip(),
+        }
+        self.accept()
+
+
+class _CrmTareaDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nueva tarea"); self.setMinimumWidth(420); self.result_data = None
+        form = QFormLayout(self)
+        self.titulo = QLineEdit()
+        self.prioridad = QComboBox()
+        for v, lbl in _CRM_PRIORIDADES:
+            self.prioridad.addItem(lbl, v)
+        self.prioridad.setCurrentIndex(1)
+        self.con_fecha = QCheckBox("Con fecha límite")
+        self.fecha = QDateEdit(QDate.currentDate()); self.fecha.setCalendarPopup(True); self.fecha.setEnabled(False)
+        self.con_fecha.toggled.connect(self.fecha.setEnabled)
+        self.desc = QTextEdit(); self.desc.setMaximumHeight(60)
+        form.addRow("Título *", self.titulo)
+        form.addRow("Prioridad", self.prioridad)
+        form.addRow(self.con_fecha, self.fecha)
+        form.addRow("Descripción", self.desc)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        if not self.titulo.text().strip():
+            QMessageBox.warning(self, "CRM", "El título es obligatorio."); return
+        self.result_data = {
+            "titulo": self.titulo.text().strip(), "prioridad": self.prioridad.currentData(),
+            "fecha_limite": self.fecha.date().toString("yyyy-MM-dd") if self.con_fecha.isChecked() else None,
+            "descripcion": self.desc.toPlainText().strip(),
+        }
+        self.accept()
+
+
+class _CrmActividadDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Registrar actividad"); self.setMinimumWidth(420); self.result_data = None
+        form = QFormLayout(self)
+        self.tipo = QComboBox()
+        for v, lbl in _CRM_ACT_TIPOS:
+            self.tipo.addItem(lbl, v)
+        self.asunto = QLineEdit()
+        self.desc = QTextEdit(); self.desc.setMaximumHeight(70)
+        form.addRow("Tipo", self.tipo)
+        form.addRow("Asunto", self.asunto)
+        form.addRow("Detalle", self.desc)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def data(self):
+        return {"tipo": self.tipo.currentData(), "asunto": self.asunto.text().strip(),
+                "descripcion": self.desc.toPlainText().strip()}
+
+
+class _CrmOportunidadDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nueva oportunidad"); self.setMinimumWidth(420); self.result_data = None
+        form = QFormLayout(self)
+        self.titulo = QLineEdit()
+        self.monto = QDoubleSpinBox(); self.monto.setRange(0, 999_999_999); self.monto.setPrefix("$ "); self.monto.setGroupSeparatorShown(True)
+        self.prob = QSpinBox(); self.prob.setRange(0, 100); self.prob.setValue(50); self.prob.setSuffix(" %")
+        self.etapa = QComboBox()
+        for v, lbl in _CRM_ETAPAS:
+            self.etapa.addItem(lbl, v)
+        form.addRow("Título *", self.titulo)
+        form.addRow("Monto estimado", self.monto)
+        form.addRow("Probabilidad", self.prob)
+        form.addRow("Etapa", self.etapa)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        if not self.titulo.text().strip():
+            QMessageBox.warning(self, "CRM", "El título es obligatorio."); return
+        self.result_data = {"titulo": self.titulo.text().strip(), "monto_estimado": self.monto.value(),
+                            "probabilidad": self.prob.value(), "etapa": self.etapa.currentData()}
+        self.accept()
+
+
+class _CrmContactDetailDialog(QDialog):
+    """Ficha 360° del contacto: datos + actividades + tareas + oportunidades."""
+
+    def __init__(self, parent, store, contacto, can, user_cb):
+        super().__init__(parent)
+        self.store = store; self.c = contacto; self.can = can; self.user_cb = user_cb
+        self.setWindowTitle(f"Contacto · {contacto.get('nombre')}")
+        self.setMinimumSize(620, 640)
+        self._build()
+
+    def _user(self):
+        return self.user_cb() if self.user_cb else None
+
+    def _rid(self):
+        return self.c.get("remote_id")
+
+    def _build(self):
+        colores = _cb_brand_colors()
+        root = QVBoxLayout(self); root.setSpacing(10)
+        # Cabecera
+        head = QFrame(); head.setObjectName("sectionPanel")
+        hl = QVBoxLayout(head); hl.setContentsMargins(16, 12, 16, 12); hl.setSpacing(2)
+        top = QHBoxLayout()
+        name = QLabel(self.c.get("nombre") or ""); name.setObjectName("pageTitle")
+        top.addWidget(name)
+        chip = _cb_chip(_CRM_TIPO_LABEL.get(self.c.get("tipo"), self.c.get("tipo") or ""), _crm_tipo_color(colores, self.c.get("tipo")))
+        top.addWidget(chip); top.addStretch(1)
+        hl.addLayout(top)
+        sub = " · ".join(x for x in [self.c.get("empresa"), self.c.get("cargo"), self.c.get("ciudad")] if x)
+        if sub:
+            s = QLabel(sub); s.setObjectName("muted"); hl.addWidget(s)
+        contacto_line = " · ".join(x for x in [self.c.get("telefono"), self.c.get("email"), self.c.get("whatsapp")] if x)
+        if contacto_line:
+            cl = QLabel(contacto_line); cl.setObjectName("muted"); hl.addWidget(cl)
+        if self._rid() is None:
+            warn = QLabel("⏳ Contacto local sin sincronizar — sincroniza para poder agregar tareas, actividades y oportunidades.")
+            warn.setStyleSheet(f"color: {colores['acento']}; font-weight: 700;"); warn.setWordWrap(True)
+            hl.addWidget(warn)
+        root.addWidget(head)
+
+        self.tabs = QTabWidget()
+        self.tab_act = QWidget(); self.tab_tar = QWidget(); self.tab_opp = QWidget()
+        for t in (self.tab_act, self.tab_tar, self.tab_opp):
+            QVBoxLayout(t).setContentsMargins(2, 8, 2, 2)
+        self.tabs.addTab(self.tab_act, "Actividades")
+        self.tabs.addTab(self.tab_tar, "Tareas")
+        self.tabs.addTab(self.tab_opp, "Oportunidades")
+        root.addWidget(self.tabs, 1)
+        self._render_actividades(); self._render_tareas(); self._render_oportunidades()
+
+    def _toolbar(self, layout, btn_text, slot, enabled=True):
+        bar = QHBoxLayout(); bar.addStretch(1)
+        b = QPushButton(btn_text); b.setObjectName("primaryAction"); b.setEnabled(enabled); b.clicked.connect(slot)
+        bar.addWidget(b); layout.addLayout(bar)
+
+    def _clear(self, w):
+        lay = w.layout()
+        while lay.count() > 0:
+            it = lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+            elif it.layout():
+                clear_layout(it.layout())
+
+    # Actividades
+    def _render_actividades(self):
+        self._clear(self.tab_act); lay = self.tab_act.layout()
+        can_add = self.can("crm", "create") and self._rid() is not None
+        self._toolbar(lay, "＋  Registrar actividad", self._add_actividad, can_add)
+        rows = self.store.crm_list_actividades(self._rid()) if self._rid() is not None else []
+        if not rows:
+            m = QLabel("Sin actividades registradas."); m.setObjectName("muted"); lay.addWidget(m)
+        tbl = QTableWidget(len(rows), 3)
+        tbl.setHorizontalHeaderLabels(["Fecha", "Tipo", "Asunto / detalle"])
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.verticalHeader().setVisible(False); tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for i, a in enumerate(rows):
+            tbl.setItem(i, 0, QTableWidgetItem((a.get("fecha_actividad") or "")[:16]))
+            tbl.setItem(i, 1, QTableWidgetItem(dict(_CRM_ACT_TIPOS).get(a.get("tipo"), a.get("tipo") or "")))
+            det = a.get("asunto") or ""
+            if a.get("descripcion"):
+                det += " — " + a["descripcion"]
+            tbl.setItem(i, 2, QTableWidgetItem(det))
+        lay.addWidget(tbl, 1)
+
+    def _add_actividad(self):
+        dlg = _CrmActividadDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        d = dlg.data()
+        try:
+            self.store.crm_crear_actividad(self._rid(), d["tipo"], d["asunto"], d["descripcion"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._render_actividades()
+
+    # Tareas
+    def _render_tareas(self):
+        self._clear(self.tab_tar); lay = self.tab_tar.layout(); colores = _cb_brand_colors()
+        can_add = self.can("crm", "create") and self._rid() is not None
+        self._toolbar(lay, "＋  Nueva tarea", self._add_tarea, can_add)
+        rows = self.store.crm_list_tareas(self._rid()) if self._rid() is not None else []
+        if not rows:
+            m = QLabel("Sin tareas."); m.setObjectName("muted"); lay.addWidget(m)
+        for t in rows:
+            lay.addWidget(self._tarea_row(t, colores))
+
+    def _tarea_row(self, t, colores):
+        row = QFrame(); row.setObjectName("sectionPanel")
+        rl = QHBoxLayout(row); rl.setContentsMargins(12, 8, 12, 8); rl.setSpacing(8)
+        done = t["estado"] == "completada"
+        chip = _cb_chip(_CRM_PRIORIDAD_LABEL.get(t["prioridad"], t["prioridad"]), _crm_prioridad_color(colores, t["prioridad"]))
+        rl.addWidget(chip)
+        txt = QLabel(("✓ " if done else "") + (t["titulo"] or ""))
+        txt.setStyleSheet("color:#9ca3af; text-decoration: line-through;" if done else "font-weight:600;")
+        rl.addWidget(txt, 1)
+        if t.get("fecha_limite"):
+            f = QLabel(t["fecha_limite"]); f.setObjectName("muted"); rl.addWidget(f)
+        if not done and self.can("crm", "edit"):
+            b = QPushButton("Completar"); b.setObjectName("secondaryAction"); b.setStyleSheet("min-height:24px;padding:0 8px;")
+            b.clicked.connect(lambda _=False, lid=t["local_id"]: self._completar_tarea(lid))
+            rl.addWidget(b)
+        if self.can("crm", "delete"):
+            d = QPushButton("✕"); d.setObjectName("inlineDanger"); d.setStyleSheet("min-height:24px;padding:0;min-width:26px;")
+            d.clicked.connect(lambda _=False, lid=t["local_id"]: self._eliminar_tarea(lid))
+            rl.addWidget(d)
+        return row
+
+    def _add_tarea(self):
+        dlg = _CrmTareaDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.crm_crear_tarea(self._rid(), d["titulo"], d["descripcion"], d["prioridad"], d["fecha_limite"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._render_tareas()
+
+    def _completar_tarea(self, lid):
+        try:
+            self.store.crm_completar_tarea(lid, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._render_tareas()
+
+    def _eliminar_tarea(self, lid):
+        self.store.crm_eliminar_tarea(lid, user=self._user()); self._render_tareas()
+
+    # Oportunidades
+    def _render_oportunidades(self):
+        self._clear(self.tab_opp); lay = self.tab_opp.layout(); colores = _cb_brand_colors()
+        can_add = self.can("crm", "create") and self._rid() is not None
+        self._toolbar(lay, "＋  Nueva oportunidad", self._add_opp, can_add)
+        rows = self.store.crm_list_oportunidades(self._rid()) if self._rid() is not None else []
+        if not rows:
+            m = QLabel("Sin oportunidades."); m.setObjectName("muted"); lay.addWidget(m)
+        for o in rows:
+            row = QFrame(); row.setObjectName("sectionPanel")
+            rl = QHBoxLayout(row); rl.setContentsMargins(12, 8, 12, 8); rl.setSpacing(8)
+            rl.addWidget(_cb_chip(_CRM_ETAPA_LABEL.get(o["etapa"], o["etapa"]), _crm_etapa_color(colores, o["etapa"])))
+            t = QLabel(o["titulo"] or ""); t.setStyleSheet("font-weight:600;"); rl.addWidget(t, 1)
+            val = QLabel(f"{_rt_money(o['monto_estimado'])} · {o['probabilidad']}%")
+            val.setStyleSheet(f"color:{colores['primario_oscuro']};font-weight:800;"); rl.addWidget(val)
+            if self.can("crm", "delete"):
+                d = QPushButton("✕"); d.setObjectName("inlineDanger"); d.setStyleSheet("min-height:24px;padding:0;min-width:26px;")
+                d.clicked.connect(lambda _=False, lid=o["local_id"]: self._eliminar_opp(lid))
+                rl.addWidget(d)
+            lay.addWidget(row)
+
+    def _add_opp(self):
+        dlg = _CrmOportunidadDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.crm_crear_oportunidad(self._rid(), d["titulo"], d["monto_estimado"], d["probabilidad"], d["etapa"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._render_oportunidades()
+
+    def _eliminar_opp(self, lid):
+        self.store.crm_eliminar_oportunidad(lid, user=self._user()); self._render_oportunidades()
+
+
+class CrmPage(QWidget):
+    """CRM offline-first: contactos, tareas y pipeline de oportunidades.
+    Sincroniza con producción vía outbox crm_op."""
+
+    _CELL_BTN = "min-height:26px;padding:0 10px;font-size:12px;"
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
+        self._all_contactos = []
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _build(self):
+        root = QVBoxLayout(self); root.setContentsMargins(24, 22, 24, 16); root.setSpacing(12)
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("CRM"); title.setObjectName("pageTitle")
+        sub = QLabel("Contactos, tareas y pipeline comercial. Funciona sin internet; sincroniza con producción.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.sync_label = QLabel(""); self.sync_label.setObjectName("rtSyncLabel")
+        header.addWidget(self.sync_label)
+        self.nuevo_btn = QPushButton("＋  Nuevo contacto"); self.nuevo_btn.setObjectName("primaryAction")
+        self.nuevo_btn.clicked.connect(self._nuevo_contacto)
+        header.addWidget(self.nuevo_btn)
+        refresh = QPushButton("↻  Refrescar"); refresh.setObjectName("secondaryAction")
+        refresh.clicked.connect(self.refresh)
+        header.addWidget(refresh)
+        root.addLayout(header)
+
+        self.kpis = QGridLayout(); self.kpis.setSpacing(10)
+        root.addLayout(self.kpis)
+
+        self.tabs = QTabWidget()
+        self.tab_contactos = QWidget(); self.tab_tareas = QWidget(); self.tab_pipeline = QWidget()
+        for t in (self.tab_contactos, self.tab_tareas, self.tab_pipeline):
+            QVBoxLayout(t).setContentsMargins(2, 10, 2, 2)
+        self.tabs.addTab(self.tab_contactos, "Contactos")
+        self.tabs.addTab(self.tab_tareas, "Tareas")
+        self.tabs.addTab(self.tab_pipeline, "Pipeline")
+        root.addWidget(self.tabs, 1)
+        self.refresh()
+
+    def refresh(self):
+        pend = self.store.crm_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync"); self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado"); self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label); self.sync_label.style().polish(self.sync_label)
+        self.nuevo_btn.setVisible(self.can("crm", "create"))
+        self._render_kpis()
+        self._all_contactos = self.store.crm_list_contactos()
+        self._render_contactos()
+        self._render_tareas()
+        self._render_pipeline()
+
+    def _render_kpis(self):
+        clear_layout(self.kpis)
+        colores = _cb_brand_colors()
+        k = self.store.crm_kpis()
+        self.kpis.addWidget(_CbKpiCard("☺", "Contactos", str(k["contactos"]), "en la base", colores["primario"]), 0, 0)
+        self.kpis.addWidget(_CbKpiCard("✓", "Tareas pendientes", str(k["tareas_pendientes"]),
+                                       "por hacer", colores["acento"]), 0, 1)
+        self.kpis.addWidget(_CbKpiCard("⚠", "Tareas vencidas", str(k["tareas_vencidas"]),
+                                       "requieren atención" if k["tareas_vencidas"] else "al día",
+                                       colores["peligro"] if k["tareas_vencidas"] else colores["acento_secundario"]), 0, 2)
+        self.kpis.addWidget(_CbKpiCard("$", "Pipeline abierto", _cb_money_compact(k["pipeline"]),
+                                       f"{k['oportunidades_abiertas']} oportunidad(es)", colores["acento_secundario"]), 0, 3)
+
+    # ── Contactos ──
+    def _render_contactos(self):
+        lay = self.tab_contactos.layout(); clear_layout(lay)
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self.search = QLineEdit(); self.search.setPlaceholderText("⌕  Buscar por nombre, empresa, email o teléfono")
+        self.search.textChanged.connect(self._fill_contactos)
+        bar.addWidget(self.search, 1)
+        self.f_tipo = QComboBox(); self.f_tipo.addItem("Todos los tipos", None)
+        for v, l in _CRM_TIPOS:
+            self.f_tipo.addItem(l, v)
+        self.f_tipo.currentIndexChanged.connect(self._fill_contactos)
+        bar.addWidget(self.f_tipo)
+        lay.addLayout(bar)
+        self.tabla = QTableWidget(0, 7)
+        self.tabla.setHorizontalHeaderLabels(["", "Nombre", "Tipo", "Empresa", "Teléfono", "Email", ""])
+        self.tabla.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tabla.setColumnWidth(0, 50)
+        self.tabla.setColumnWidth(2, 110)
+        self.tabla.setColumnWidth(6, 210)
+        self.tabla.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tabla.verticalHeader().setVisible(False); self.tabla.verticalHeader().setDefaultSectionSize(52)
+        self.tabla.setSortingEnabled(True)
+        self.tabla.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tabla.doubleClicked.connect(lambda _i: self._abrir_contacto())
+        lay.addWidget(self.tabla, 1)
+        hint = QLabel("Doble clic en un contacto para abrir su ficha 360° (actividades, tareas y oportunidades).")
+        hint.setObjectName("muted")
+        lay.addWidget(hint)
+        self._fill_contactos()
+
+    def _fill_contactos(self):
+        colores = _cb_brand_colors()
+        needle = self.search.text().strip().lower() if hasattr(self, "search") else ""
+        tipo = self.f_tipo.currentData() if hasattr(self, "f_tipo") else None
+        rows = [c for c in self._all_contactos
+                if (not tipo or c["tipo"] == tipo) and
+                (not needle or needle in ((c.get("nombre") or "") + " " + (c.get("empresa") or "") + " " +
+                                          (c.get("email") or "") + " " + (c.get("telefono") or "")).lower())]
+        self.tabla.setSortingEnabled(False)
+        self.tabla.setRowCount(len(rows))
+        for i, c in enumerate(rows):
+            tipo_color = _crm_tipo_color(colores, c["tipo"])
+            self.tabla.setCellWidget(i, 0, _crm_avatar(c.get("nombre"), tipo_color))
+            nombre = (c["nombre"] or "") + ("  ⏳" if c["synced"] == 0 else "")
+            it = QTableWidgetItem(nombre); it.setData(Qt.ItemDataRole.UserRole, c["local_id"])
+            f = it.font(); f.setBold(True); it.setFont(f)
+            self.tabla.setItem(i, 1, it)
+            self.tabla.setCellWidget(i, 2, _crm_pill(_CRM_TIPO_LABEL.get(c["tipo"], c["tipo"] or ""), tipo_color))
+            self.tabla.setItem(i, 2, QTableWidgetItem(c["tipo"] or ""))  # valor oculto para orden
+            self.tabla.setItem(i, 3, QTableWidgetItem(c.get("empresa") or ""))
+            self.tabla.setItem(i, 4, QTableWidgetItem(c.get("telefono") or ""))
+            self.tabla.setItem(i, 5, QTableWidgetItem(c.get("email") or ""))
+            actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(4, 0, 4, 0); al.setSpacing(4)
+            ver = QPushButton("Abrir"); ver.setObjectName("secondaryAction"); ver.setStyleSheet(self._CELL_BTN)
+            ver.clicked.connect(lambda _=False, lid=c["local_id"]: self._abrir_contacto(lid))
+            al.addWidget(ver)
+            if self.can("crm", "edit"):
+                ed = QPushButton("Editar"); ed.setObjectName("secondaryAction"); ed.setStyleSheet(self._CELL_BTN)
+                ed.clicked.connect(lambda _=False, lid=c["local_id"]: self._editar_contacto(lid))
+                al.addWidget(ed)
+            if self.can("crm", "delete"):
+                dl = QPushButton("✕"); dl.setObjectName("inlineDanger"); dl.setStyleSheet("min-height:26px;padding:0;min-width:28px;")
+                dl.clicked.connect(lambda _=False, lid=c["local_id"]: self._eliminar_contacto(lid))
+                al.addWidget(dl)
+            al.addStretch(1)
+            self.tabla.setCellWidget(i, 6, actions)
+        self.tabla.setSortingEnabled(True)
+        if not rows:
+            self.tabla.setRowCount(1)
+            self.tabla.setSpan(0, 0, 1, 7)
+            empty = QLabel("Sin contactos. Crea el primero con “＋ Nuevo contacto”." if not needle
+                           else "Ningún contacto coincide con la búsqueda.")
+            empty.setObjectName("muted"); empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.tabla.setCellWidget(0, 0, empty)
+
+    def _contacto_por_local(self, local_id):
+        return next((c for c in self._all_contactos if c["local_id"] == local_id), None)
+
+    def _selected_local(self):
+        r = self.tabla.currentRow()
+        if r < 0:
+            return None
+        it = self.tabla.item(r, 0)
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _abrir_contacto(self, local_id=None):
+        local_id = local_id if local_id is not None else self._selected_local()
+        c = self._contacto_por_local(local_id) if local_id is not None else None
+        if not c:
+            return
+        _CrmContactDetailDialog(self, self.store, c, self.can, self.user_callback).exec()
+        self._after_change()
+
+    def _nuevo_contacto(self):
+        if not self.can("crm", "create"):
+            return
+        dlg = _CrmContactDialog(self, can_use_ai=self.can("ia", "use"))
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            self.store.crm_crear_contacto(dlg.result_data, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._after_change()
+
+    def _editar_contacto(self, local_id):
+        c = self._contacto_por_local(local_id)
+        if not c:
+            return
+        dlg = _CrmContactDialog(self, c, can_use_ai=self.can("ia", "use"))
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            self.store.crm_editar_contacto(local_id, dlg.result_data, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._after_change()
+
+    def _eliminar_contacto(self, local_id):
+        if QMessageBox.question(self, "Eliminar", "¿Eliminar este contacto?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.crm_eliminar_contacto(local_id, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._after_change()
+
+    # ── Tareas (global) ──
+    def _render_tareas(self):
+        lay = self.tab_tareas.layout(); clear_layout(lay)
+        colores = _cb_brand_colors()
+        nombre_por_rid = {c["remote_id"]: c["nombre"] for c in self._all_contactos if c["remote_id"] is not None}
+        rows = self.store.crm_list_tareas(solo_pendientes=False)
+        pend = [t for t in rows if t["estado"] == "pendiente"]
+        if not pend:
+            m = QLabel("No hay tareas pendientes. 🎉"); m.setObjectName("muted"); lay.addWidget(m)
+        hoy = date.today().isoformat()
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget(); il = QVBoxLayout(inner); il.setContentsMargins(0, 0, 0, 0); il.setSpacing(8)
+        for t in pend:
+            row = QFrame(); row.setObjectName("sectionPanel")
+            rl = QHBoxLayout(row); rl.setContentsMargins(12, 8, 12, 8); rl.setSpacing(8)
+            rl.addWidget(_cb_chip(_CRM_PRIORIDAD_LABEL.get(t["prioridad"], t["prioridad"]), _crm_prioridad_color(colores, t["prioridad"])))
+            txt = QLabel(t["titulo"] or ""); txt.setStyleSheet("font-weight:600;")
+            rl.addWidget(txt, 1)
+            cont = nombre_por_rid.get(t.get("contacto_remote_id"))
+            if cont:
+                cl = QLabel(cont); cl.setObjectName("muted"); rl.addWidget(cl)
+            if t.get("fecha_limite"):
+                vencida = t["fecha_limite"] < hoy
+                f = QLabel(("⚠ " if vencida else "") + t["fecha_limite"])
+                f.setStyleSheet(f"color:{colores['peligro']};font-weight:700;" if vencida else "color:#6b7280;")
+                rl.addWidget(f)
+            if self.can("crm", "edit"):
+                b = QPushButton("Completar"); b.setObjectName("secondaryAction"); b.setStyleSheet(self._CELL_BTN)
+                b.clicked.connect(lambda _=False, lid=t["local_id"]: self._completar_tarea(lid))
+                rl.addWidget(b)
+            il.addWidget(row)
+        il.addStretch(1)
+        scroll.setWidget(inner); lay.addWidget(scroll, 1)
+
+    def _completar_tarea(self, lid):
+        try:
+            self.store.crm_completar_tarea(lid, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "CRM", str(exc)); return
+        self._after_change()
+
+    # ── Pipeline ──
+    def _render_pipeline(self):
+        lay = self.tab_pipeline.layout(); clear_layout(lay)
+        colores = _cb_brand_colors()
+        opps = self.store.crm_list_oportunidades()
+        nombre_por_rid = {c["remote_id"]: c["nombre"] for c in self._all_contactos if c["remote_id"] is not None}
+        por_etapa = {e: [] for e, _ in _CRM_ETAPAS}
+        for o in opps:
+            por_etapa.setdefault(o["etapa"], []).append(o)
+        cols = QHBoxLayout(); cols.setSpacing(10)
+        for etapa, label in _CRM_ETAPAS:
+            items = por_etapa.get(etapa, [])
+            total = sum(float(o["monto_estimado"] or 0) for o in items)
+            color = _crm_etapa_color(colores, etapa)
+            colf = QFrame(); colf.setObjectName("sectionPanel")
+            cv = QVBoxLayout(colf); cv.setContentsMargins(10, 10, 10, 10); cv.setSpacing(6)
+            head = QLabel(f"{label.upper()}  ·  {len(items)}")
+            head.setStyleSheet(f"color:{color};font-size:11px;font-weight:800;letter-spacing:0.8px;border-bottom:2px solid {color};padding-bottom:4px;")
+            cv.addWidget(head)
+            tot = QLabel(_cb_money_compact(total)); tot.setStyleSheet(f"color:{colores['primario_oscuro']};font-weight:800;")
+            cv.addWidget(tot)
+            for o in items[:30]:
+                card = QFrame()
+                ac = QColor(color)
+                card.setStyleSheet(f"QFrame{{background:#fff;border:1px solid #e5e7eb;border-left:3px solid {color};border-radius:8px;}} QLabel{{border:0;}}")
+                cl = QVBoxLayout(card); cl.setContentsMargins(8, 6, 8, 6); cl.setSpacing(1)
+                t = QLabel(o["titulo"] or ""); t.setStyleSheet("font-weight:700;font-size:11px;"); t.setWordWrap(True)
+                cl.addWidget(t)
+                cont = nombre_por_rid.get(o.get("contacto_remote_id"))
+                if cont:
+                    cc = QLabel(cont); cc.setStyleSheet("color:#9ca3af;font-size:10px;"); cl.addWidget(cc)
+                val = QLabel(f"{_cb_money_compact(o['monto_estimado'])} · {o['probabilidad']}%")
+                val.setStyleSheet(f"color:{color};font-size:10px;font-weight:800;")
+                cl.addWidget(val)
+                cv.addWidget(card)
+            cv.addStretch(1)
+            cols.addWidget(colf)
+        wrap = QWidget(); wrap.setLayout(cols)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(wrap)
+        lay.addWidget(scroll, 1)
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
+# =============================================================================
+# Nómina — empleados, períodos, liquidación offline (motor nomina_calc)
+# =============================================================================
+_N_VINCULACIONES = [("EMPLEADO", "Empleado"), ("CONTRATISTA", "Contratista"),
+                    ("APRENDIZ_SENA", "Aprendiz SENA")]
+_N_VINC_LABEL = dict(_N_VINCULACIONES)
+_N_NOVEDAD_TIPOS = [("HED", "Hora extra diurna"), ("HEN", "Hora extra nocturna"),
+                    ("HEDF", "H.E. diurna festiva"), ("HENF", "H.E. nocturna festiva"),
+                    ("RN", "Recargo nocturno"), ("RD", "Recargo dominical/festivo"),
+                    ("INCAPACIDAD_GEN", "Incapacidad general"), ("INCAPACIDAD_LAB", "Incapacidad laboral"),
+                    ("LICENCIA_MAT", "Licencia maternidad"), ("LICENCIA_PAT", "Licencia paternidad"),
+                    ("LICENCIA_LUTO", "Licencia luto"), ("LICENCIA_NR", "Licencia no remunerada")]
+_N_NOVEDAD_LABEL = dict(_N_NOVEDAD_TIPOS)
+
+
+class _EmpleadoDialog(QDialog):
+    """Alta/edición de empleado de nómina."""
+
+    def __init__(self, parent, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Editar empleado" if data else "Nuevo empleado")
+        self.setMinimumWidth(520)
+        self.result_data = None
+        data = data or {}
+        root = QVBoxLayout(self)
+        form = QGridLayout(); form.setHorizontalSpacing(12); form.setVerticalSpacing(6)
+        self.tipo_doc = QComboBox()
+        for v in ("CC", "CE", "TI", "PAS", "NIT", "PEP"):
+            self.tipo_doc.addItem(v, v)
+        self.tipo_doc.setCurrentText(data.get("tipo_documento") or "CC")
+        self.num_doc = QLineEdit(data.get("numero_documento") or "")
+        self.nombres = QLineEdit(data.get("nombres") or "")
+        self.apellidos = QLineEdit(data.get("apellidos") or "")
+        self.cargo = QLineEdit(data.get("cargo") or "")
+        self.vinc = QComboBox()
+        for v, lbl in _N_VINCULACIONES:
+            self.vinc.addItem(lbl, v)
+        i = self.vinc.findData((data.get("tipo_vinculacion") or "EMPLEADO"))
+        self.vinc.setCurrentIndex(i if i >= 0 else 0)
+        self.salario = QDoubleSpinBox(); self.salario.setRange(0, 999_999_999); self.salario.setPrefix("$ ")
+        self.salario.setGroupSeparatorShown(True); self.salario.setValue(float(data.get("salario_base") or 0))
+        self.nivel_arl = QComboBox()
+        for v in ("I", "II", "III", "IV", "V"):
+            self.nivel_arl.addItem(v, v)
+        self.nivel_arl.setCurrentText(data.get("nivel_arl") or "I")
+        self.fecha_ing = QDateEdit(); self.fecha_ing.setCalendarPopup(True)
+        self.fecha_ing.setDate(QDate.fromString(data.get("fecha_ingreso") or QDate.currentDate().toString("yyyy-MM-dd"), "yyyy-MM-dd"))
+        self.email = QLineEdit(data.get("email") or "")
+        self.telefono = QLineEdit(data.get("telefono") or "")
+        self.eps = QLineEdit(data.get("eps") or "")
+        self.fondo_pension = QLineEdit(data.get("fondo_pension") or "")
+        self.fondo_cesantias = QLineEdit(data.get("fondo_cesantias") or "")
+        self.banco = QLineEdit(data.get("banco") or "")
+        self.num_cuenta = QLineEdit(data.get("numero_cuenta") or "")
+
+        def _lbl(t):
+            l = QLabel(t.upper()); l.setObjectName("eyebrowMuted"); return l
+        campos = [
+            ("Tipo doc.", self.tipo_doc), ("Documento *", self.num_doc),
+            ("Nombres *", self.nombres), ("Apellidos", self.apellidos),
+            ("Cargo", self.cargo), ("Vinculación", self.vinc),
+            ("Salario base *", self.salario), ("Nivel ARL", self.nivel_arl),
+            ("Fecha ingreso", self.fecha_ing), ("Email", self.email),
+            ("Teléfono", self.telefono), ("EPS", self.eps),
+            ("Fondo pensión", self.fondo_pension), ("Fondo cesantías", self.fondo_cesantias),
+            ("Banco", self.banco), ("N° cuenta", self.num_cuenta),
+        ]
+        for idx, (lbl, w) in enumerate(campos):
+            r, c = divmod(idx, 2)
+            form.addWidget(_lbl(lbl), r * 2, c)
+            form.addWidget(w, r * 2 + 1, c)
+        root.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _accept(self):
+        if not self.nombres.text().strip():
+            QMessageBox.warning(self, "Nómina", "Los nombres son obligatorios."); return
+        if self.salario.value() <= 0:
+            QMessageBox.warning(self, "Nómina", "El salario base debe ser mayor a cero."); return
+        self.result_data = {
+            "tipo_documento": self.tipo_doc.currentData(), "numero_documento": self.num_doc.text().strip(),
+            "nombres": self.nombres.text().strip(), "apellidos": self.apellidos.text().strip(),
+            "cargo": self.cargo.text().strip(), "tipo_vinculacion": self.vinc.currentData(),
+            "salario_base": self.salario.value(), "nivel_arl": self.nivel_arl.currentData(),
+            "fecha_ingreso": self.fecha_ing.date().toString("yyyy-MM-dd"),
+            "email": self.email.text().strip(), "telefono": self.telefono.text().strip(),
+            "eps": self.eps.text().strip(), "fondo_pension": self.fondo_pension.text().strip(),
+            "fondo_cesantias": self.fondo_cesantias.text().strip(), "banco": self.banco.text().strip(),
+            "tipo_cuenta": "ahorros", "numero_cuenta": self.num_cuenta.text().strip(), "direccion": "",
+        }
+        self.accept()
+
+
+class _PeriodoDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Nuevo período"); self.setMinimumWidth(420); self.result_data = None
+        form = QFormLayout(self)
+        hoy = QDate.currentDate()
+        self.anio = QSpinBox(); self.anio.setRange(2024, 2030); self.anio.setValue(hoy.year())
+        self.mes = QSpinBox(); self.mes.setRange(1, 12); self.mes.setValue(hoy.month())
+        self.numero = QComboBox()
+        self.numero.addItem("Quincena 1 (1-15)", 1); self.numero.addItem("Quincena 2 (16-30)", 2)
+        self.numero.addItem("Mensual (1-30)", 0)
+        self.fi = QDateEdit(hoy); self.fi.setCalendarPopup(True)
+        self.ff = QDateEdit(hoy); self.ff.setCalendarPopup(True)
+        self.numero.currentIndexChanged.connect(self._auto_fechas)
+        self.anio.valueChanged.connect(self._auto_fechas)
+        self.mes.valueChanged.connect(self._auto_fechas)
+        form.addRow("Año", self.anio)
+        form.addRow("Mes", self.mes)
+        form.addRow("Período", self.numero)
+        form.addRow("Desde", self.fi)
+        form.addRow("Hasta", self.ff)
+        self._auto_fechas()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _auto_fechas(self):
+        a, m, np = self.anio.value(), self.mes.value(), self.numero.currentData()
+        if np == 1:
+            self.fi.setDate(QDate(a, m, 1)); self.ff.setDate(QDate(a, m, 15))
+        elif np == 2:
+            self.fi.setDate(QDate(a, m, 16)); self.ff.setDate(QDate(a, m, 30))
+        else:
+            self.fi.setDate(QDate(a, m, 1)); self.ff.setDate(QDate(a, m, 30))
+
+    def _accept(self):
+        self.result_data = {
+            "anio": self.anio.value(), "mes": self.mes.value(),
+            "numero_periodo": self.numero.currentData() or 0,
+            "fecha_inicio": self.fi.date().toString("yyyy-MM-dd"),
+            "fecha_fin": self.ff.date().toString("yyyy-MM-dd"),
+        }
+        self.accept()
+
+
+class _NovedadDialog(QDialog):
+    """Registra una novedad; calcula valor_total con el motor (nomina_calc)."""
+
+    def __init__(self, parent, empleados, fecha_periodo, params):
+        super().__init__(parent)
+        self.setWindowTitle("Registrar novedad"); self.setMinimumWidth(440)
+        self.result_data = None
+        self._empleados = empleados
+        self._fecha = fecha_periodo
+        self._params = params
+        form = QFormLayout(self)
+        self.empleado = QComboBox()
+        for e in empleados:
+            self.empleado.addItem(f"{e['nombres']} {e.get('apellidos') or ''}".strip(), e)
+        self.tipo = QComboBox()
+        for v, lbl in _N_NOVEDAD_TIPOS:
+            self.tipo.addItem(lbl, v)
+        self.cantidad = QDoubleSpinBox(); self.cantidad.setRange(0, 10000); self.cantidad.setDecimals(1); self.cantidad.setValue(1)
+        self.cant_hint = QLabel("horas (extras/recargos) o días (incapacidades/licencias)")
+        self.cant_hint.setObjectName("muted")
+        self.fecha = QDateEdit(QDate.fromString(fecha_periodo or QDate.currentDate().toString("yyyy-MM-dd"), "yyyy-MM-dd"))
+        self.fecha.setCalendarPopup(True)
+        form.addRow("Empleado", self.empleado)
+        form.addRow("Tipo", self.tipo)
+        form.addRow("Cantidad", self.cantidad)
+        form.addRow("", self.cant_hint)
+        form.addRow("Fecha", self.fecha)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept); btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _accept(self):
+        emp = self.empleado.currentData()
+        if not emp:
+            QMessageBox.warning(self, "Nómina", "No hay empleados."); return
+        if emp.get("remote_id") is None:
+            QMessageBox.warning(self, "Nómina", "Sincroniza el empleado antes de registrar novedades."); return
+        import nomina_calc
+        tipo = self.tipo.currentData()
+        cant = self.cantidad.value()
+        fecha = self.fecha.date().toString("yyyy-MM-dd")
+        salario = float(emp.get("salario_base") or 0)
+        smmlv = float(self._params.get("salario_minimo") or 0)
+        if tipo in nomina_calc.TIPOS_EXTRAS:
+            vh = nomina_calc.calcular_valor_hora(salario)
+            from datetime import date as _d
+            valor = nomina_calc.calcular_horas_extras(vh, tipo, cant, _d.fromisoformat(fecha))
+        elif tipo in nomina_calc.TIPOS_LICENCIAS_REMUNERADAS:
+            valor = nomina_calc.calcular_incapacidad(salario, int(cant), tipo, smmlv) if hasattr(nomina_calc, "calcular_incapacidad") else 0
+        else:
+            valor = 0
+        self.result_data = {"empleado_remote_id": emp["remote_id"], "tipo_novedad": tipo,
+                            "cantidad": cant, "valor_total": valor, "fecha_novedad": fecha}
+        self.accept()
+
+
+class NominaPage(QWidget):
+    """Nómina offline-first: empleados, períodos con liquidación local (motor
+    nomina_calc, idéntico al servidor), novedades y desprendibles."""
+
+    _CELL_BTN = "min-height:26px;padding:0 10px;font-size:12px;"
+
+    def __init__(self, store: LocalStore, on_changed, user_callback=None, can_callback=None):
+        super().__init__()
+        self.store = store
+        self.on_changed = on_changed
+        self.user_callback = user_callback
+        self.can = can_callback or (lambda m, a: True)
+        self._build()
+
+    def _user(self):
+        return self.user_callback() if self.user_callback else None
+
+    def _build(self):
+        root = QVBoxLayout(self); root.setContentsMargins(24, 22, 24, 16); root.setSpacing(12)
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("Nómina"); title.setObjectName("pageTitle")
+        sub = QLabel("Empleados, períodos y liquidación. Cálculo local con el motor verificado; sincroniza con producción.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.sync_label = QLabel(""); self.sync_label.setObjectName("rtSyncLabel")
+        header.addWidget(self.sync_label)
+        refresh = QPushButton("↻  Refrescar"); refresh.setObjectName("secondaryAction")
+        refresh.clicked.connect(self.refresh)
+        header.addWidget(refresh)
+        root.addLayout(header)
+
+        self.kpis = QGridLayout(); self.kpis.setSpacing(10)
+        root.addLayout(self.kpis)
+
+        self.tabs = QTabWidget()
+        self.tab_emp = QWidget(); self.tab_per = QWidget(); self.tab_par = QWidget()
+        for t in (self.tab_emp, self.tab_per, self.tab_par):
+            QVBoxLayout(t).setContentsMargins(2, 10, 2, 2)
+        self.tabs.addTab(self.tab_emp, "Empleados")
+        self.tabs.addTab(self.tab_per, "Períodos")
+        self.tabs.addTab(self.tab_par, "Parámetros")
+        root.addWidget(self.tabs, 1)
+        self.refresh()
+
+    def refresh(self):
+        pend = self.store.n_pending_count()
+        if pend:
+            self.sync_label.setText(f"⏳ {pend} pendiente(s) de sync"); self.sync_label.setProperty("state", "pending")
+        else:
+            self.sync_label.setText("✓ Sincronizado"); self.sync_label.setProperty("state", "ok")
+        self.sync_label.style().unpolish(self.sync_label); self.sync_label.style().polish(self.sync_label)
+        self._render_kpis()
+        self._render_empleados()
+        self._render_periodos()
+        self._render_parametros()
+
+    def _render_kpis(self):
+        clear_layout(self.kpis)
+        colores = _cb_brand_colors()
+        emps = self.store.n_list_empleados()
+        periodos = self.store.n_list_periodos()
+        ultimo_neto = 0.0
+        if periodos:
+            det = self.store.n_list_detalle(periodos[0]["local_id"])
+            ultimo_neto = sum(float(d["neto_pagar"] or 0) for d in det)
+        params = self.store.n_get_parametros(date.today().year)
+        self.kpis.addWidget(_CbKpiCard("☺", "Empleados activos", str(len(emps)), "en nómina", colores["primario"]), 0, 0)
+        self.kpis.addWidget(_CbKpiCard("₲", "Último período (neto)", _cb_money_compact(ultimo_neto),
+                                       "total a pagar", colores["acento_secundario"]), 0, 1)
+        self.kpis.addWidget(_CbKpiCard("▦", "Períodos", str(len(periodos)), "liquidaciones", colores["acento"]), 0, 2)
+        self.kpis.addWidget(_CbKpiCard("$", f"SMMLV {date.today().year}", _cb_money_compact(params["salario_minimo"]),
+                                       f"Aux. {_cb_money_compact(params['auxilio_transporte'])}", colores["primario_oscuro"]), 0, 3)
+
+    # ── Empleados ──
+    def _render_empleados(self):
+        lay = self.tab_emp.layout(); clear_layout(lay)
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self.search = QLineEdit(); self.search.setPlaceholderText("⌕  Buscar por nombre, documento o cargo")
+        self.search.textChanged.connect(self._fill_empleados)
+        bar.addWidget(self.search, 1)
+        if self.can("payroll", "create"):
+            nuevo = QPushButton("＋  Nuevo empleado"); nuevo.setObjectName("primaryAction")
+            nuevo.clicked.connect(self._nuevo_empleado)
+            bar.addWidget(nuevo)
+        lay.addLayout(bar)
+        self.emp_table = QTableWidget(0, 6)
+        self.emp_table.setHorizontalHeaderLabels(["Nombre", "Documento", "Cargo", "Vinculación", "Salario", ""])
+        self.emp_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.emp_table.setColumnWidth(5, 170)
+        self.emp_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.emp_table.verticalHeader().setVisible(False); self.emp_table.verticalHeader().setDefaultSectionSize(46)
+        self.emp_table.setSortingEnabled(True)
+        lay.addWidget(self.emp_table, 1)
+        self._all_emp = self.store.n_list_empleados()
+        self._fill_empleados()
+
+    def _fill_empleados(self):
+        colores = _cb_brand_colors()
+        needle = self.search.text().strip().lower() if hasattr(self, "search") else ""
+        rows = [e for e in self._all_emp if not needle or needle in (
+            (e.get("nombres") or "") + " " + (e.get("apellidos") or "") + " " +
+            (e.get("numero_documento") or "") + " " + (e.get("cargo") or "")).lower()]
+        self.emp_table.setSortingEnabled(False)
+        self.emp_table.setRowCount(len(rows))
+        for i, e in enumerate(rows):
+            nombre = f"{e.get('nombres') or ''} {e.get('apellidos') or ''}".strip() + ("  ⏳" if e["synced"] == 0 else "")
+            it = QTableWidgetItem(nombre); it.setData(Qt.ItemDataRole.UserRole, e["local_id"])
+            self.emp_table.setItem(i, 0, it)
+            self.emp_table.setItem(i, 1, QTableWidgetItem(f"{e.get('tipo_documento') or ''} {e.get('numero_documento') or ''}".strip()))
+            self.emp_table.setItem(i, 2, QTableWidgetItem(e.get("cargo") or ""))
+            self.emp_table.setItem(i, 3, QTableWidgetItem(_N_VINC_LABEL.get(e.get("tipo_vinculacion"), e.get("tipo_vinculacion") or "")))
+            self.emp_table.setItem(i, 4, _NumItem(_rt_money(e.get("salario_base")), e.get("salario_base")))
+            actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(4, 0, 4, 0); al.setSpacing(4)
+            if self.can("payroll", "edit"):
+                ed = QPushButton("Editar"); ed.setObjectName("secondaryAction"); ed.setStyleSheet(self._CELL_BTN)
+                ed.clicked.connect(lambda _=False, lid=e["local_id"]: self._editar_empleado(lid))
+                al.addWidget(ed)
+            if self.can("payroll", "delete"):
+                dl = QPushButton("✕"); dl.setObjectName("inlineDanger"); dl.setStyleSheet("min-height:26px;padding:0;min-width:28px;")
+                dl.clicked.connect(lambda _=False, lid=e["local_id"]: self._eliminar_empleado(lid))
+                al.addWidget(dl)
+            al.addStretch(1)
+            self.emp_table.setCellWidget(i, 5, actions)
+        self.emp_table.setSortingEnabled(True)
+
+    def _nuevo_empleado(self):
+        dlg = _EmpleadoDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            self.store.n_crear_empleado(dlg.result_data, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Nómina", str(exc)); return
+        self._after_change()
+
+    def _editar_empleado(self, lid):
+        e = self.store.n_get_empleado(lid)
+        if not e:
+            return
+        dlg = _EmpleadoDialog(self, e)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        try:
+            self.store.n_editar_empleado(lid, dlg.result_data, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Nómina", str(exc)); return
+        self._after_change()
+
+    def _eliminar_empleado(self, lid):
+        if QMessageBox.question(self, "Eliminar", "¿Desactivar este empleado?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.n_eliminar_empleado(lid, user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Nómina", str(exc)); return
+        self._after_change()
+
+    # ── Períodos ──
+    def _render_periodos(self):
+        lay = self.tab_per.layout(); clear_layout(lay)
+        colores = _cb_brand_colors()
+        bar = QHBoxLayout()
+        info = QLabel("Crea un período y liquídalo offline. El cálculo es idéntico al del servidor.")
+        info.setObjectName("muted"); bar.addWidget(info, 1)
+        if self.can("payroll", "create"):
+            nuevo = QPushButton("＋  Nuevo período"); nuevo.setObjectName("primaryAction")
+            nuevo.clicked.connect(self._nuevo_periodo); bar.addWidget(nuevo)
+        lay.addLayout(bar)
+        periodos = self.store.n_list_periodos()
+        if not periodos:
+            m = QLabel("Sin períodos. Crea el primero."); m.setObjectName("muted"); lay.addWidget(m); return
+        tbl = QTableWidget(len(periodos), 6)
+        tbl.setHorizontalHeaderLabels(["Período", "Desde", "Hasta", "Estado", "Neto liquidado", ""])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tbl.setColumnWidth(4, 130)
+        tbl.setColumnWidth(5, 320)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False); tbl.verticalHeader().setDefaultSectionSize(46)
+        for i, p in enumerate(periodos):
+            np = p.get("numero_periodo")
+            etq = f"{p['anio']}-{str(p.get('mes') or 0).zfill(2)} " + ({1: "Q1", 2: "Q2"}.get(np, "Mensual"))
+            etq += ("  ⏳" if p["synced"] == 0 else "")
+            tbl.setItem(i, 0, QTableWidgetItem(etq))
+            tbl.setItem(i, 1, QTableWidgetItem(p.get("fecha_inicio") or ""))
+            tbl.setItem(i, 2, QTableWidgetItem(p.get("fecha_fin") or ""))
+            est = p.get("estado_local") or "borrador"
+            ecol = colores["acento_secundario"] if est == "liquidado" else colores["acento"]
+            est_w = _cb_chip(est.capitalize(), ecol)
+            tbl.setCellWidget(i, 3, est_w)
+            det = self.store.n_list_detalle(p["local_id"])
+            neto = sum(float(d["neto_pagar"] or 0) for d in det)
+            ni = QTableWidgetItem(_rt_money(neto) if det else "—")
+            tbl.setItem(i, 4, ni)
+            actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(4, 0, 4, 0); al.setSpacing(4)
+            if self.can("payroll", "create"):
+                liq = QPushButton("Liquidar"); liq.setObjectName("primaryAction"); liq.setStyleSheet(self._CELL_BTN)
+                liq.clicked.connect(lambda _=False, lid=p["local_id"]: self._liquidar(lid))
+                al.addWidget(liq)
+                nov = QPushButton("Novedades"); nov.setObjectName("secondaryAction"); nov.setStyleSheet(self._CELL_BTN)
+                nov.clicked.connect(lambda _=False, lid=p["local_id"]: self._novedades(lid))
+                al.addWidget(nov)
+            ver = QPushButton("Desprendibles"); ver.setObjectName("secondaryAction"); ver.setStyleSheet(self._CELL_BTN)
+            ver.clicked.connect(lambda _=False, lid=p["local_id"]: self._ver_desprendibles(lid))
+            al.addWidget(ver); al.addStretch(1)
+            tbl.setCellWidget(i, 5, actions)
+        lay.addWidget(tbl, 1)
+
+    def _nuevo_periodo(self):
+        dlg = _PeriodoDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        d = dlg.result_data
+        try:
+            self.store.n_crear_periodo(d["anio"], d["mes"], d["numero_periodo"], d["fecha_inicio"], d["fecha_fin"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Nómina", str(exc)); return
+        self._after_change()
+
+    def _liquidar(self, periodo_local_id):
+        import nomina_calc
+        p = self.store.n_get_periodo(periodo_local_id)
+        if not p:
+            return
+        params = self.store.n_get_parametros(p["anio"])
+        if not params.get("salario_minimo"):
+            QMessageBox.warning(self, "Nómina", f"No hay parámetros para el año {p['anio']}."); return
+        emps_raw = self.store.n_list_empleados()
+        sin_sync = [e for e in emps_raw if e["remote_id"] is None]
+        empleados = [{**e, "id": e["remote_id"] or e["local_id"]} for e in emps_raw]
+        novedades = []
+        if p.get("remote_id") is not None:
+            for nv in self.store.n_list_novedades(p["remote_id"]):
+                novedades.append({"empleado_id": nv["empleado_remote_id"], "tipo_novedad": nv["tipo_novedad"],
+                                  "cantidad": nv["cantidad"], "valor_total": nv["valor_total"]})
+        periodo = {"anio": p["anio"], "numero_periodo": p.get("numero_periodo"),
+                   "fecha_inicio": p.get("fecha_inicio"), "fecha_fin": p.get("fecha_fin")}
+        res = nomina_calc.liquidar_periodo(periodo, params, empleados, novedades)
+        try:
+            self.store.n_guardar_liquidacion(periodo_local_id, res["detalles"], user=self._user())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Nómina", str(exc)); return
+        msg = (f"Liquidación calculada (motor local, idéntico al servidor):\n\n"
+               f"Empleados: {res['resumen']['empleados']}  ·  Contratistas: {res['resumen']['contratistas']}\n"
+               f"Total devengado: {_rt_money(res['resumen']['total_devengado'])}\n"
+               f"Total neto a pagar: {_rt_money(res['resumen']['total_neto'])}")
+        if sin_sync:
+            msg += f"\n\n⚠ {len(sin_sync)} empleado(s) sin sincronizar: se liquidaron con id local provisional."
+        alertas = res.get("alertas", [])
+        if alertas:
+            msg += "\n\nAlertas normativas (" + str(len(alertas)) + "):\n- " + "\n- ".join(a["mensaje"] for a in alertas[:6])
+        QMessageBox.information(self, "Liquidación", msg)
+        self._after_change()
+        self._ver_desprendibles(periodo_local_id)
+
+    def _ver_desprendibles(self, periodo_local_id):
+        det = self.store.n_list_detalle(periodo_local_id)
+        if not det:
+            QMessageBox.information(self, "Desprendibles", "Este período no tiene liquidación. Usa “Liquidar”."); return
+        emp_nombre = {}
+        for e in self.store.n_list_empleados(incluir_inactivos=True):
+            emp_nombre[e["remote_id"] or e["local_id"]] = f"{e.get('nombres') or ''} {e.get('apellidos') or ''}".strip()
+        dlg = QDialog(self); dlg.setWindowTitle("Desprendibles del período"); dlg.setMinimumSize(900, 520)
+        v = QVBoxLayout(dlg)
+        tbl = QTableWidget(len(det), 9)
+        tbl.setHorizontalHeaderLabels(["Empleado", "Días", "Básico", "Aux. transp.", "Extras",
+                                       "Salud", "Pensión", "Retención", "Neto"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        for i, d in enumerate(det):
+            tbl.setItem(i, 0, QTableWidgetItem(emp_nombre.get(d["empleado_remote_id"], f"#{d['empleado_remote_id']}")))
+            tbl.setItem(i, 1, QTableWidgetItem(str(d["dias_trabajados"])))
+            for col, key in ((2, "sueldo_basico"), (3, "auxilio_transporte"), (4, "horas_extras"),
+                             (5, "salud_empleado"), (6, "pension_empleado"), (7, "retencion_fuente"), (8, "neto_pagar")):
+                tbl.setItem(i, col, QTableWidgetItem(_rt_money(d.get(key))))
+        v.addWidget(tbl, 1)
+        total = sum(float(d["neto_pagar"] or 0) for d in det)
+        tot = QLabel(f"Total neto a pagar:  {_rt_money(total)}")
+        tot.setStyleSheet(f"font-size:15px;font-weight:850;color:{_cb_brand_colors()['primario_oscuro']};")
+        v.addWidget(tot, 0, Qt.AlignmentFlag.AlignRight)
+        close = QPushButton("Cerrar"); close.setObjectName("secondaryAction"); close.clicked.connect(dlg.accept)
+        v.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
+
+    def _novedades(self, periodo_local_id):
+        p = self.store.n_get_periodo(periodo_local_id)
+        if not p:
+            return
+        if p.get("remote_id") is None:
+            QMessageBox.information(self, "Novedades", "Sincroniza el período antes de registrar novedades."); return
+        emps = [e for e in self.store.n_list_empleados() if e["remote_id"] is not None]
+        if not emps:
+            QMessageBox.information(self, "Novedades", "No hay empleados sincronizados."); return
+        params = self.store.n_get_parametros(p["anio"])
+        dlg = QDialog(self); dlg.setWindowTitle("Novedades del período"); dlg.setMinimumSize(680, 460)
+        v = QVBoxLayout(dlg)
+        bar = QHBoxLayout(); bar.addStretch(1)
+        add = QPushButton("＋  Registrar novedad"); add.setObjectName("primaryAction")
+        bar.addWidget(add); v.addLayout(bar)
+        tbl = QTableWidget(0, 5)
+        tbl.setHorizontalHeaderLabels(["Empleado", "Tipo", "Cantidad", "Valor", ""])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); tbl.verticalHeader().setVisible(False)
+        v.addWidget(tbl, 1)
+        emp_nombre = {e["remote_id"]: f"{e.get('nombres') or ''} {e.get('apellidos') or ''}".strip() for e in emps}
+
+        def _fill():
+            rows = self.store.n_list_novedades(p["remote_id"])
+            tbl.setRowCount(len(rows))
+            for i, nv in enumerate(rows):
+                tbl.setItem(i, 0, QTableWidgetItem(emp_nombre.get(nv["empleado_remote_id"], f"#{nv['empleado_remote_id']}")))
+                tbl.setItem(i, 1, QTableWidgetItem(_N_NOVEDAD_LABEL.get(nv["tipo_novedad"], nv["tipo_novedad"])))
+                tbl.setItem(i, 2, QTableWidgetItem(str(nv["cantidad"])))
+                tbl.setItem(i, 3, QTableWidgetItem(_rt_money(nv["valor_total"])))
+                d = QPushButton("✕"); d.setObjectName("inlineDanger"); d.setStyleSheet("min-height:24px;padding:0;min-width:26px;")
+                d.clicked.connect(lambda _=False, lid=nv["local_id"]: (self.store.n_eliminar_novedad(lid, user=self._user()), _fill()))
+                w = QWidget(); wl = QHBoxLayout(w); wl.setContentsMargins(4, 0, 4, 0); wl.addWidget(d)
+                tbl.setCellWidget(i, 4, w)
+
+        def _add():
+            nd = _NovedadDialog(dlg, emps, p.get("fecha_fin"), params)
+            if nd.exec() != QDialog.DialogCode.Accepted or not nd.result_data:
+                return
+            r = nd.result_data
+            try:
+                self.store.n_crear_novedad(p["remote_id"], r["empleado_remote_id"], r["tipo_novedad"],
+                                           r["cantidad"], r["valor_total"], r["fecha_novedad"], user=self._user())
+            except ValueError as exc:
+                QMessageBox.warning(dlg, "Nómina", str(exc)); return
+            _fill()
+        add.clicked.connect(_add)
+        _fill()
+        dlg.exec()
+        self._after_change()
+
+    # ── Parámetros ──
+    def _render_parametros(self):
+        lay = self.tab_par.layout(); clear_layout(lay)
+        colores = _cb_brand_colors()
+        info = QLabel("Parámetros oficiales usados en la liquidación. El servidor es la fuente; offline se usan los valores portados.")
+        info.setObjectName("muted"); info.setWordWrap(True); lay.addWidget(info)
+        import nomina_calc
+        tbl = QTableWidget(0, 5)
+        tbl.setHorizontalHeaderLabels(["Año", "SMMLV", "Auxilio transporte", "UVT", "Jornada/sem"])
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); tbl.verticalHeader().setVisible(False)
+        anios = sorted(nomina_calc.PARAMETROS_OFICIALES_NOMINA.keys())
+        tbl.setRowCount(len(anios))
+        for i, a in enumerate(anios):
+            par = self.store.n_get_parametros(a)
+            tbl.setItem(i, 0, QTableWidgetItem(str(a)))
+            tbl.setItem(i, 1, QTableWidgetItem(_rt_money(par["salario_minimo"])))
+            tbl.setItem(i, 2, QTableWidgetItem(_rt_money(par["auxilio_transporte"])))
+            tbl.setItem(i, 3, QTableWidgetItem(_rt_money(par["uvt"])))
+            tbl.setItem(i, 4, QTableWidgetItem(f"{nomina_calc.JORNADA_LEY_2101.get(a, 42)} h"))
+        lay.addWidget(tbl, 1)
+
+    def _after_change(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
+# =============================================================================
+# Asistente IA — Chat del negocio (online-only, licenciado por tenant)
+# =============================================================================
+_IA_SUGERENCIAS = [
+    "¿Cuánto vendí este mes?",
+    "¿Qué productos tienen poco stock?",
+    "¿Cuáles son mis productos más vendidos?",
+    "¿Qué pedidos están por despachar?",
+]
+
+
+class _IaBubble(QFrame):
+    """Burbuja de chat (usuario a la derecha, asistente a la izquierda)."""
+
+    def __init__(self, texto: str, es_usuario: bool, colores: dict, herramienta: str | None = None):
+        super().__init__()
+        self.setObjectName("iaBubbleUser" if es_usuario else "iaBubbleBot")
+        prim = colores.get("primario", "#122c94")
+        bg = prim if es_usuario else "#ffffff"
+        fg = "#ffffff" if es_usuario else "#1f2937"
+        border = "transparent" if es_usuario else "rgba(17,24,39,0.08)"
+        self.setStyleSheet(
+            f"QFrame#{self.objectName()} {{ background: {bg}; border: 1px solid {border};"
+            f" border-radius: 14px; }}"
+        )
+        v = QVBoxLayout(self); v.setContentsMargins(14, 10, 14, 10); v.setSpacing(4)
+        lbl = QLabel(texto); lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"color: {fg}; font-size: 14px; background: transparent;")
+        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(lbl)
+        if herramienta and not es_usuario:
+            tag = QLabel(f"✦ vía {herramienta}")
+            tag.setStyleSheet(f"color: {prim}; font-size: 11px; font-weight: 700; background: transparent;")
+            v.addWidget(tag)
+
+
+class AsistenteIAPage(QWidget):
+    """Chat 'Pregúntale a tu negocio'. Online-only: consulta al servidor (proxy
+    de Ollama) y responde con datos reales del tenant. Si no hay red/licencia,
+    muestra un estado vacío elegante y deshabilita el input (sin panel roto).
+    Historial persistente local (tabla ia_chat) para revisar aunque no haya red."""
+
+    def __init__(self, store: LocalStore, user_callback=None, can_callback=None):
+        super().__init__()
+        self.store = store
+        self.user_callback = user_callback or (lambda: None)
+        self.can = can_callback or (lambda m, a: True)
+        self._worker = None
+        self._estado_worker = None
+        self._online = False
+        self._build()
+
+    def _build(self):
+        colores = _cb_brand_colors()
+        root = QVBoxLayout(self); root.setContentsMargins(24, 22, 24, 18); root.setSpacing(12)
+
+        header = QHBoxLayout()
+        col = QVBoxLayout(); col.setSpacing(2)
+        title = QLabel("Asistente IA"); title.setObjectName("pageTitle")
+        sub = QLabel("Pregúntale a tu negocio. Responde con tus datos reales; requiere conexión.")
+        sub.setObjectName("muted"); sub.setWordWrap(True)
+        col.addWidget(title); col.addWidget(sub)
+        header.addLayout(col, 1)
+        self.estado_chip = QLabel("Verificando…")
+        self.estado_chip.setObjectName("iaEstadoChip")
+        self.estado_chip.setStyleSheet(
+            "QLabel#iaEstadoChip { background: rgba(17,24,39,0.06); color:#6b7280;"
+            " border-radius: 10px; padding: 6px 12px; font-weight: 700; font-size: 12px; }"
+        )
+        header.addWidget(self.estado_chip)
+        limpiar = QPushButton("Limpiar historial"); limpiar.setObjectName("secondaryAction")
+        limpiar.clicked.connect(self._clear_history)
+        header.addWidget(limpiar)
+        root.addLayout(header)
+
+        # Área de conversación (scroll)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.msg_host = QWidget(); self.msg_host.setStyleSheet("background: transparent;")
+        self.msg_layout = QVBoxLayout(self.msg_host)
+        self.msg_layout.setContentsMargins(4, 4, 12, 4); self.msg_layout.setSpacing(10)
+        self.msg_layout.addStretch(1)
+        self.scroll.setWidget(self.msg_host)
+        root.addWidget(self.scroll, 1)
+
+        # Estado vacío (se muestra cuando no hay red/licencia)
+        self.empty_state = _crm_empty_state(
+            "✦", "El asistente necesita conexión",
+            "Conéctate a internet para preguntarle a tu negocio. El historial de "
+            "conversaciones anteriores queda disponible aquí.",
+            colores.get("primario", "#122c94"),
+        )
+        self.empty_state.setVisible(False)
+        root.addWidget(self.empty_state)
+
+        # Chips de sugerencias
+        self.chips_row = QHBoxLayout(); self.chips_row.setSpacing(8)
+        for s in _IA_SUGERENCIAS:
+            chip = QPushButton(s); chip.setObjectName("iaChip")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setStyleSheet(
+                "QPushButton#iaChip { background: rgba(17,24,39,0.05); color:#374151;"
+                " border: 1px solid rgba(17,24,39,0.08); border-radius: 14px;"
+                " padding: 6px 12px; font-size: 12px; } "
+                "QPushButton#iaChip:hover { background: rgba(17,24,39,0.10); }"
+            )
+            chip.clicked.connect(lambda _=False, txt=s: self._enviar(txt))
+            self.chips_row.addWidget(chip)
+        self.chips_row.addStretch(1)
+        self.chips_wrap = _wrap_layout(self.chips_row)
+        root.addWidget(self.chips_wrap)
+
+        # Input
+        input_row = QHBoxLayout(); input_row.setSpacing(8)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Escribe tu pregunta…")
+        self.input.setMinimumHeight(42)
+        self.input.returnPressed.connect(self._on_send_clicked)
+        self.send_btn = QPushButton("Preguntar"); self.send_btn.setObjectName("primaryAction")
+        self.send_btn.setMinimumHeight(42)
+        self.send_btn.clicked.connect(self._on_send_clicked)
+        input_row.addWidget(self.input, 1)
+        input_row.addWidget(self.send_btn)
+        root.addLayout(input_row)
+
+        self._load_history()
+
+    # ── Ciclo de vida ────────────────────────────────────────────
+    def refresh(self):
+        """Se llama al mostrar la página: reevalúa disponibilidad en segundo plano."""
+        self._set_estado("Verificando…", "#6b7280", enabled=False)
+        client = _ai_build_client()
+        if client is None:
+            self._aplicar_estado({"online": False, "licenciado": False,
+                                  "motivo": "Sincronización no configurada."})
+            return
+        if self._estado_worker and self._estado_worker.isRunning():
+            return
+        self._estado_worker = _BgWorker(lambda: client.ai_estado(), self)
+        self._estado_worker.done.connect(self._aplicar_estado)
+        self._estado_worker.failed.connect(lambda _msg: self._aplicar_estado(
+            {"online": False, "licenciado": True, "motivo": "Sin conexión con el servidor."}))
+        self._estado_worker.start()
+
+    def _aplicar_estado(self, estado: dict):
+        online = bool(estado.get("online"))
+        licenciado = estado.get("licenciado", True)
+        self._online = online and licenciado
+        if not licenciado:
+            self._set_estado("No incluido en el plan", "#b42318", enabled=False)
+        elif online:
+            modelo = estado.get("modelo") or "IA"
+            self._set_estado(f"● En línea · {modelo}", "#15803d", enabled=True)
+        else:
+            self._set_estado("● Sin conexión", "#b42318", enabled=False)
+        # Estado vacío visible solo cuando NO se puede chatear
+        self.empty_state.setVisible(not self._online)
+        self.scroll.setVisible(self._online or self.msg_layout.count() > 1)
+        self.chips_wrap.setVisible(self._online)
+
+    def _set_estado(self, texto: str, color: str, enabled: bool):
+        self.estado_chip.setText(texto)
+        self.estado_chip.setStyleSheet(
+            f"QLabel#iaEstadoChip {{ background: rgba(17,24,39,0.06); color:{color};"
+            f" border-radius: 10px; padding: 6px 12px; font-weight: 700; font-size: 12px; }}"
+        )
+        self.input.setEnabled(enabled)
+        self.send_btn.setEnabled(enabled)
+
+    # ── Chat ─────────────────────────────────────────────────────
+    def _on_send_clicked(self):
+        self._enviar(self.input.text())
+
+    def _enviar(self, pregunta: str):
+        pregunta = (pregunta or "").strip()
+        if not pregunta or not self._online:
+            return
+        if self._worker and self._worker.isRunning():
+            return
+        self.input.clear()
+        self._add_bubble(pregunta, es_usuario=True)
+        self.store.ia_add_message("user", pregunta)
+        thinking = self._add_bubble("Pensando…", es_usuario=False)
+        self.send_btn.setEnabled(False); self.input.setEnabled(False)
+        client = _ai_build_client()
+        if client is None:
+            self._reemplazar_thinking(thinking, "No hay conexión configurada.", None)
+            self._set_busy(False)
+            return
+        self._worker = _BgWorker(lambda: client.ai_chat(pregunta), self)
+        self._worker.done.connect(lambda resp: self._on_chat_done(thinking, resp))
+        self._worker.failed.connect(lambda msg: self._on_chat_fail(thinking, msg))
+        self._worker.start()
+
+    def _on_chat_done(self, thinking, resp: dict):
+        if not isinstance(resp, dict) or not resp.get("success"):
+            motivo = (resp or {}).get("error") if isinstance(resp, dict) else None
+            self._reemplazar_thinking(thinking, motivo or "No pude responder ahora.", None)
+        else:
+            texto = resp.get("respuesta") or "Sin respuesta."
+            herramienta = resp.get("herramienta")
+            self._reemplazar_thinking(thinking, texto, herramienta)
+            self.store.ia_add_message("assistant", texto, herramienta)
+        self._set_busy(False)
+
+    def _on_chat_fail(self, thinking, msg: str):
+        self._reemplazar_thinking(thinking, "Sin conexión con el asistente. Intenta de nuevo.", None)
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool):
+        self.send_btn.setEnabled(not busy and self._online)
+        self.input.setEnabled(not busy and self._online)
+        if not busy:
+            self.input.setFocus()
+
+    # ── Render helpers ───────────────────────────────────────────
+    def _add_bubble(self, texto: str, es_usuario: bool, herramienta: str | None = None) -> _IaBubble:
+        colores = _cb_brand_colors()
+        bubble = _IaBubble(texto, es_usuario, colores, herramienta)
+        wrap = QHBoxLayout()
+        if es_usuario:
+            wrap.addStretch(1); wrap.addWidget(bubble, 4)
+        else:
+            wrap.addWidget(bubble, 4); wrap.addStretch(1)
+        container = _wrap_layout(wrap)
+        # Insertar antes del stretch final
+        self.msg_layout.insertWidget(self.msg_layout.count() - 1, container)
+        QTimer.singleShot(30, self._scroll_to_bottom)
+        bubble._container = container
+        return bubble
+
+    def _reemplazar_thinking(self, thinking: _IaBubble, texto: str, herramienta):
+        container = getattr(thinking, "_container", None)
+        if container is not None:
+            container.setParent(None)
+        self._add_bubble(texto, es_usuario=False, herramienta=herramienta)
+
+    def _scroll_to_bottom(self):
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _load_history(self):
+        for msg in self.store.ia_recent(limit=30):
+            self._add_bubble(msg.get("texto") or "", es_usuario=(msg.get("rol") == "user"),
+                             herramienta=msg.get("herramienta"))
+
+    def _clear_history(self):
+        confirm = QMessageBox.question(self, "Limpiar historial",
+                                       "¿Borrar el historial de conversaciones local?")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.store.ia_clear()
+        while self.msg_layout.count() > 1:
+            item = self.msg_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+
+# =============================================================================
 # Shell
 # =============================================================================
 class DesktopShell(QMainWindow):
@@ -5794,7 +8245,12 @@ class DesktopShell(QMainWindow):
         ("products",  "▤", "Productos",       "F2", "Datos"),
         ("inventory", "⊞", "Inventario",      "F4", "Datos"),
         ("contabilidad", "Σ", "Contabilidad", "F10", "Datos"),
+        ("quotes",    "✎", "Cotizaciones",    "F11", "Datos"),
+        ("cobros",    "₵", "Cuentas de cobro", "F12", "Datos"),
         ("users",     "◯", "Usuarios",        "F6", "Datos"),
+        ("crm",       "☺", "CRM",             "",    "Clientes"),
+        ("payroll",   "₲", "Nómina",          "",    "Administración"),
+        ("ia",        "✦", "Asistente IA",    "",    "Inteligencia"),
         ("sync",      "⟳", "Sincronización",  "F7", "Sistema"),
         ("config",    "✎", "Configuración",   "F8", "Sistema"),
     ]
@@ -5803,6 +8259,7 @@ class DesktopShell(QMainWindow):
         super().__init__()
         self.store = LocalStore()
         self.user = None
+        self._perms = None          # entrada de permisos del rol actual (manifiesto)
         self._app_dir = app_data_dir()
         self._install_conf = install_conf.load(self._app_dir)
         self._bootstrap_sync_from_install_conf()
@@ -5894,7 +8351,26 @@ class DesktopShell(QMainWindow):
         user_outer.addLayout(user_text, 1)
         side_layout.addWidget(self.user_card)
 
-        # Nav items agrupados por sección
+        # Nav items agrupados por sección, dentro de un scroll transparente para
+        # que la barra no se desborde ni recorte rótulos cuando hay muchos
+        # módulos o la ventana es baja. El scroll solo aparece si hace falta.
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; }"
+            " QScrollArea > QWidget > QWidget { background: transparent; }"
+            " QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: rgba(255,255,255,0.25); border-radius: 3px; min-height: 30px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        nav_host = QWidget()
+        nav_host.setStyleSheet("background: transparent;")
+        nav_layout = QVBoxLayout(nav_host)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(4)
+
         self.nav_buttons = {}
         self.nav_section_labels = {}   # section -> QLabel (para ocultar si queda vacía)
         self.nav_sections = {}         # section -> [keys] (para saber si quedó vacía)
@@ -5903,7 +8379,7 @@ class DesktopShell(QMainWindow):
             if section != last_section:
                 section_label = QLabel(section)
                 section_label.setObjectName("sidebarSection")
-                side_layout.addWidget(section_label)
+                nav_layout.addWidget(section_label)
                 self.nav_section_labels[section] = section_label
                 last_section = section
             self.nav_sections.setdefault(section, []).append(key)
@@ -5912,9 +8388,11 @@ class DesktopShell(QMainWindow):
             button.setToolTip(f"{label} ({shortcut})")
             button.clicked.connect(lambda checked=False, name=key: self._show_section(name))
             self.nav_buttons[key] = button
-            side_layout.addWidget(button)
+            nav_layout.addWidget(button)
+        nav_layout.addStretch(1)
+        nav_scroll.setWidget(nav_host)
+        side_layout.addWidget(nav_scroll, 1)
 
-        side_layout.addStretch(1)
         logout = QPushButton("  ↪    Cerrar sesión")
         logout.setObjectName("logoutButton")
         logout.clicked.connect(self._logout)
@@ -5923,13 +8401,18 @@ class DesktopShell(QMainWindow):
         self.content_stack = QStackedWidget()
         self.pages = {
             "dashboard": DashboardPage(self.store, self._show_section),
-            "products": ProductsPage(self.store, self._refresh_shared_pages),
-            "pos": PosPage(self.store, self._refresh_shared_pages, scanner=self.scanner, brand_callback=self._get_branding),
-            "restaurant": RestaurantPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
-            "contabilidad": ContabilidadPage(self.store, self._refresh_shared_pages, user_callback=self._get_user),
-            "inventory": InventoryPage(self.store, self._refresh_shared_pages),
+            "products": ProductsPage(self.store, self._refresh_shared_pages, can_callback=self.can),
+            "pos": PosPage(self.store, self._refresh_shared_pages, scanner=self.scanner, brand_callback=self._get_branding, can_callback=self.can),
+            "restaurant": RestaurantPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "contabilidad": ContabilidadPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "quotes": CotizacionesPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "cobros": CuentasCobroPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "crm": CrmPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "payroll": NominaPage(self.store, self._refresh_shared_pages, user_callback=self._get_user, can_callback=self.can),
+            "ia": AsistenteIAPage(self.store, user_callback=self._get_user, can_callback=self.can),
+            "inventory": InventoryPage(self.store, self._refresh_shared_pages, can_callback=self.can),
             "sales": SalesPage(self.store, brand_callback=self._get_branding),
-            "users": UsersPage(self.store, self._refresh_shared_pages),
+            "users": UsersPage(self.store, self._refresh_shared_pages, can_callback=self.can),
             "sync": SyncPage(self.store, self._refresh_shared_pages, base_dir=self._app_dir, user_callback=self._get_user),
             "config": ConfiguracionPage(self.branding, self._app_dir, on_apply=self.apply_branding),
         }
@@ -6002,15 +8485,31 @@ class DesktopShell(QMainWindow):
 
     def _apply_access_control(self, role: str):
         """Muestra solo los módulos permitidos por ROL ∩ PLAN del tenant.
-        El rol es espejo de security.py; el plan viene de los flags cacheados
-        de cliente_config (vía /sync/config). Sin flags cacheados => solo rol
-        (fail-open). Oculta botones de nav y etiquetas de sección vacías."""
-        role_allowed = modules_for_role(role)
+        Los módulos/acciones del rol vienen del MANIFIESTO server-authoritative
+        (derivado de security.py) cacheado vía /sync/config; sin manifiesto cae
+        a ROLE_MODULES local (fail-open). El plan viene de los flags de
+        cliente_config. Oculta botones de nav y etiquetas de sección vacías."""
+        manifest = self.store.get_permissions_manifest()
+        entry = manifest.get(role) if isinstance(manifest, dict) else None
+        self._perms = entry if isinstance(entry, dict) else None
+        if self._perms and self._perms.get("modules"):
+            role_allowed = set(self._perms["modules"])        # manifiesto del servidor
+            # Módulos que el manifiesto cacheado aún NO conoce (p. ej. 'ia' antes
+            # de actualizar el servidor): decidir con el mapa local de roles,
+            # espejo de la web (licencia + grupo de rol, sin depender del
+            # manifiesto). Cuando el servidor emita el módulo, su veredicto gana.
+            conocidos = set()
+            for e in manifest.values():
+                if isinstance(e, dict):
+                    conocidos |= set(e.get("modules") or [])
+            role_allowed |= (set(modules_for_role(role)) - conocidos)
+        else:
+            role_allowed = set(modules_for_role(role))        # fallback local
         tenant_allowed = tenant_allowed_modules(self.store.get_tenant_modules())
         if tenant_allowed is None:
-            allowed = set(role_allowed)                       # sin restricción de plan
+            allowed = role_allowed                            # sin restricción de plan
         else:
-            allowed = set(role_allowed) & tenant_allowed      # tenant_allowed ya incluye SYSTEM_MODULES
+            allowed = role_allowed & tenant_allowed           # tenant_allowed ya incluye SYSTEM_MODULES
         self._allowed_sections = allowed
         for key, button in self.nav_buttons.items():
             button.setVisible(key in allowed)
@@ -6019,6 +8518,19 @@ class DesktopShell(QMainWindow):
             label = self.nav_section_labels.get(section)
             if label is not None:
                 label.setVisible(any(k in allowed for k in keys))
+
+    def can(self, module: str, action: str) -> bool:
+        """True si el rol actual puede `action` en `module` según el manifiesto.
+        Fail-open: sin manifiesto cacheado o sin entrada de acciones para el
+        módulo, permite (cae al gating por módulo). El servidor es la barrera
+        dura: rechaza en _apply_* lo que el rol no puede escribir."""
+        perms = getattr(self, "_perms", None)
+        if not perms:
+            return True
+        actions = (perms.get("actions") or {}).get(module)
+        if actions is None:
+            return True
+        return action in actions
 
     def _show_section(self, name):
         if self.stack.currentWidget() is not self.app_view:
@@ -6043,7 +8555,7 @@ class DesktopShell(QMainWindow):
             QTimer.singleShot(80, self.pages["pos"].focus_barcode)
 
     def _refresh_shared_pages(self):
-        for name in ("dashboard", "products", "pos", "restaurant", "contabilidad", "inventory", "sales", "users", "sync"):
+        for name in ("dashboard", "products", "pos", "restaurant", "contabilidad", "quotes", "cobros", "crm", "payroll", "inventory", "sales", "users", "sync"):
             self._refresh_page(name)
         # Tras un sync pueden haber cambiado los flags de módulos del plan:
         # re-aplica el gating sin requerir re-login. Si el módulo actualmente
@@ -6347,6 +8859,53 @@ def clear_layout(layout):
                 child.deleteLater()
 
 
+def _setup_logging():
+    """Logging con rotación en %APPDATA%/CyberShopNative/logs/desktop.log.
+    Reemplaza los print sueltos por un archivo consultable ante incidencias."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+    log_dir = app_data_dir() / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return logging.getLogger("cybershop")
+    logger = logging.getLogger("cybershop")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = RotatingFileHandler(
+            log_dir / "desktop.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(handler)
+    return logger
+
+
+def _install_excepthook(logger):
+    """Crash handler global: registra el traceback y muestra un diálogo amable
+    con opción de copiar el detalle, en lugar de cerrar la app en silencio."""
+    def _hook(exc_type, exc_value, exc_tb):
+        import traceback
+        detalle = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            logger.error("Excepción no controlada:\n%s", detalle)
+        except Exception:
+            pass
+        try:
+            box = QMessageBox()
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("CyberShop Desktop — Error inesperado")
+            box.setText("Ocurrió un error inesperado. La aplicación intentará continuar.\n"
+                        "Puedes copiar el detalle técnico para soporte.")
+            box.setDetailedText(detalle)
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()
+        except Exception:
+            # Si ni siquiera hay app Qt viva, al menos quedó en el log.
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _hook
+
+
 def main():
     if sys.platform == "win32":
         try:
@@ -6354,8 +8913,29 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CyberShop.Desktop")
         except Exception:
             pass
+
+    logger = _setup_logging()
+    logger.info("Arranque CyberShop Desktop %s", APP_VERSION)
+
     app = QApplication(sys.argv)
     app.setWindowIcon(_default_app_icon())
+
+    # Instancia única: evita 2 procesos escribiendo la misma SQLite. El lock vive
+    # mientras el proceso esté vivo (QLockFile se libera al salir/crashear).
+    lock_path = str(app_data_dir() / "app.lock")
+    lock = QLockFile(lock_path)
+    lock.setStaleLockTime(0)   # si el proceso dueño murió, se considera obsoleto
+    if not lock.tryLock(100):
+        QMessageBox.information(
+            None, "CyberShop Desktop",
+            "La aplicación ya está abierta. Se usará la ventana existente.")
+        logger.info("Segunda instancia bloqueada por QLockFile; saliendo.")
+        return 0
+    app._single_instance_lock = lock   # mantener referencia viva
+
+    # Crash handler global (necesita QApplication para el diálogo).
+    _install_excepthook(logger)
+
     quit_action = QAction("Salir")
     quit_action.triggered.connect(app.quit)
     window = DesktopShell()

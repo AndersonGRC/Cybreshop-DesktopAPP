@@ -44,12 +44,18 @@ def map_role(rol_id, rol_nombre=None) -> str:
         return "Mesero"
     if name == "cajero":
         return "Cajero"
-    if name in ("empleado", "vendedor"):
+    if name == "empleado":
         return "Empleado"
     if name == "contador":
         return "Contador"
     if name == "cliente":
         return "Cliente"
+    # Rol PERSONALIZADO creado por el dueño (p.ej. "Vendedor"): conservar el
+    # nombre tal cual — el manifiesto de permisos del servidor viene keyed por
+    # ese nombre y _apply_access_control lo encuentra. Si el manifiesto no lo
+    # trae, el shell cae al fallback prudente (DEFAULT_ROLE_MODULES).
+    if rol_nombre and rol_nombre.strip():
+        return rol_nombre.strip()
     return "Cajero"
 
 
@@ -1421,6 +1427,866 @@ class LocalStore:
             conn.execute("UPDATE cb_plantillas SET synced=1 WHERE synced=0")
             conn.execute("UPDATE cb_cierres SET synced=1 WHERE synced=0")
 
+    # ─── Cotizaciones (espejo + outbox) ───────────────────────────
+    @staticmethod
+    def q_calc_item(cantidad, precio_unitario, descuento_porc=0, iva_porc=0):
+        """Total de una línea (espejo de quotes.py): cant*precio - desc + iva."""
+        cant = int(cantidad or 0)
+        precio = float(precio_unitario or 0)
+        desc = max(0.0, min(100.0, float(descuento_porc or 0)))
+        iva = max(0.0, float(iva_porc or 0))
+        subtotal = cant * precio
+        menos_desc = subtotal - subtotal * (desc / 100)
+        return round(menos_desc + (menos_desc * iva / 100 if iva > 0 else 0), 2)
+
+    def replace_quotes_snapshot(self, data: dict):
+        """Reconstruye el espejo de cotizaciones; conserva docs locales (synced=0)."""
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM q_detalle WHERE cotizacion_local_id IN "
+                "(SELECT id FROM q_cotizaciones WHERE synced=1)"
+            )
+            conn.execute("DELETE FROM q_cotizaciones WHERE synced=1")
+            remote_to_local = {}
+            for c in (data.get("cotizaciones") or []):
+                conn.execute(
+                    """INSERT INTO q_cotizaciones
+                        (remote_id, cliente_nombre, cliente_documento, cliente_direccion,
+                         cliente_ciudad, cliente_telefono, cliente_representante, cliente_cargo,
+                         cliente_localidad, total, estado, pdf_path, fecha, synced)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                         cliente_nombre=excluded.cliente_nombre, cliente_documento=excluded.cliente_documento,
+                         cliente_direccion=excluded.cliente_direccion, cliente_ciudad=excluded.cliente_ciudad,
+                         cliente_telefono=excluded.cliente_telefono, cliente_representante=excluded.cliente_representante,
+                         cliente_cargo=excluded.cliente_cargo, cliente_localidad=excluded.cliente_localidad,
+                         total=excluded.total, estado=excluded.estado, pdf_path=excluded.pdf_path,
+                         fecha=excluded.fecha, synced=1""",
+                    (c.get("id"), c.get("cliente_nombre"), c.get("cliente_documento"),
+                     c.get("cliente_direccion"), c.get("cliente_ciudad"), c.get("cliente_telefono"),
+                     c.get("cliente_representante"), c.get("cliente_cargo"), c.get("cliente_localidad"),
+                     float(c.get("total") or 0), c.get("estado") or "pendiente", c.get("pdf_path"),
+                     c.get("fecha")),
+                )
+                row = conn.execute("SELECT id FROM q_cotizaciones WHERE remote_id=?", (c.get("id"),)).fetchone()
+                if row:
+                    remote_to_local[int(c["id"])] = int(row["id"])
+            for d in (data.get("detalles") or []):
+                lid = remote_to_local.get(int(d.get("cotizacion_id") or 0))
+                if lid is None:
+                    continue
+                conn.execute(
+                    """INSERT INTO q_detalle
+                        (remote_id, cotizacion_local_id, descripcion, cantidad, precio_unitario,
+                         subtotal, descuento_porc, iva_porc)
+                       VALUES (?,?,?,?,?,?,?,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                         descripcion=excluded.descripcion, cantidad=excluded.cantidad,
+                         precio_unitario=excluded.precio_unitario, subtotal=excluded.subtotal,
+                         descuento_porc=excluded.descuento_porc, iva_porc=excluded.iva_porc""",
+                    (d.get("id"), lid, d.get("descripcion"), int(d.get("cantidad") or 1),
+                     float(d.get("precio_unitario") or 0), float(d.get("subtotal") or 0),
+                     float(d.get("descuento_porc") or 0), float(d.get("iva_porc") or 0)),
+                )
+
+    def mark_quotes_pushed(self):
+        with self.connect() as conn:
+            conn.execute("UPDATE q_cotizaciones SET synced=1 WHERE synced=0")
+
+    def q_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='quote_op'"
+            ).fetchone()[0])
+
+    def q_list_cotizaciones(self, limit=500):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, cliente_nombre, cliente_documento,
+                          total, estado, pdf_path, fecha, synced
+                   FROM q_cotizaciones ORDER BY id DESC LIMIT ?""", (int(limit),))]
+
+    def q_get_detalle(self, local_id):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT descripcion, cantidad, precio_unitario, subtotal, descuento_porc, iva_porc
+                   FROM q_detalle WHERE cotizacion_local_id=? ORDER BY id""", (int(local_id),))]
+
+    def q_crear_cotizacion(self, cliente: dict, items: list, user=None):
+        nombre = (cliente.get("cliente_nombre") or "").strip()
+        if not nombre:
+            raise ValueError("El nombre del cliente es obligatorio.")
+        norm_items, total = [], 0.0
+        for it in (items or []):
+            desc = (it.get("descripcion") or "").strip()
+            if not desc:
+                continue
+            cant = int(it.get("cantidad") or 1)
+            precio = float(it.get("precio_unitario") or 0)
+            dpct = float(it.get("descuento_porc") or 0)
+            ipct = float(it.get("iva_porc") or 0)
+            sub = self.q_calc_item(cant, precio, dpct, ipct)
+            total += sub
+            norm_items.append({"descripcion": desc, "cantidad": cant, "precio_unitario": precio,
+                               "subtotal": sub, "descuento_porc": dpct, "iva_porc": ipct})
+        if not norm_items:
+            raise ValueError("Agrega al menos un ítem con descripción.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO q_cotizaciones
+                    (cliente_nombre, cliente_documento, cliente_direccion, cliente_ciudad,
+                     cliente_telefono, cliente_representante, cliente_cargo, cliente_localidad,
+                     total, estado, fecha, synced, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?, 'pendiente', ?, 0, CURRENT_TIMESTAMP)""",
+                (nombre, cliente.get("cliente_documento"), cliente.get("cliente_direccion"),
+                 cliente.get("cliente_ciudad"), cliente.get("cliente_telefono"),
+                 cliente.get("cliente_representante"), cliente.get("cliente_cargo"),
+                 cliente.get("cliente_localidad"), total, date.today().isoformat()),
+            )
+            local_id = int(cur.lastrowid)
+            for it in norm_items:
+                conn.execute(
+                    """INSERT INTO q_detalle (cotizacion_local_id, descripcion, cantidad,
+                         precio_unitario, subtotal, descuento_porc, iva_porc)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (local_id, it["descripcion"], it["cantidad"], it["precio_unitario"],
+                     it["subtotal"], it["descuento_porc"], it["iva_porc"]),
+                )
+            payload = {"op": "create_cotizacion", "client_op_uuid": op_uuid, "items": norm_items}
+            for k in ("cliente_nombre", "cliente_documento", "cliente_direccion", "cliente_ciudad",
+                      "cliente_telefono", "cliente_representante", "cliente_cargo", "cliente_localidad"):
+                payload[k] = cliente.get(k)
+            payload["cliente_nombre"] = nombre
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "quote_op", op_uuid, "create", payload)
+        return local_id
+
+    def q_eliminar_cotizacion(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM q_cotizaciones WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Cotización no encontrada.")
+            conn.execute("DELETE FROM q_detalle WHERE cotizacion_local_id=?", (int(local_id),))
+            conn.execute("DELETE FROM q_cotizaciones WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_cotizacion", "cotizacion_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "quote_op", _uuid.uuid4().hex, "create", payload)
+
+    def q_set_estado(self, local_id, estado, user=None):
+        estado = (estado or "").strip()
+        if estado not in ("pendiente", "aprobada", "rechazada"):
+            raise ValueError("Estado inválido.")
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM q_cotizaciones WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Cotización no encontrada.")
+            conn.execute("UPDATE q_cotizaciones SET estado=? WHERE id=?", (estado, int(local_id)))
+            if row["remote_id"] is not None:
+                payload = {"op": "set_estado_cotizacion", "cotizacion_id": int(row["remote_id"]), "estado": estado}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "quote_op", _uuid.uuid4().hex, "create", payload)
+
+    # ─── Cuentas de cobro (espejo + outbox) ───────────────────────
+    def replace_cobros_snapshot(self, data: dict):
+        """Reconstruye el espejo de cuentas de cobro; conserva docs locales (synced=0)."""
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM cc_detalle WHERE cuenta_local_id IN "
+                "(SELECT id FROM cc_cuentas WHERE synced=1)"
+            )
+            conn.execute("DELETE FROM cc_cuentas WHERE synced=1")
+            remote_to_local = {}
+            for c in (data.get("cuentas") or []):
+                conn.execute(
+                    """INSERT INTO cc_cuentas
+                        (remote_id, consecutivo, fecha, cliente_nombre, cliente_nit,
+                         cliente_direccion, cliente_telefono, cliente_ciudad, contractor_nombre,
+                         contractor_id, contractor_telefono, contractor_email, texto_pago,
+                         total, pdf_path, synced)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET
+                         consecutivo=excluded.consecutivo, fecha=excluded.fecha,
+                         cliente_nombre=excluded.cliente_nombre, cliente_nit=excluded.cliente_nit,
+                         cliente_direccion=excluded.cliente_direccion, cliente_telefono=excluded.cliente_telefono,
+                         cliente_ciudad=excluded.cliente_ciudad, contractor_nombre=excluded.contractor_nombre,
+                         contractor_id=excluded.contractor_id, contractor_telefono=excluded.contractor_telefono,
+                         contractor_email=excluded.contractor_email, texto_pago=excluded.texto_pago,
+                         total=excluded.total, pdf_path=excluded.pdf_path, synced=1""",
+                    (c.get("id"), c.get("consecutivo"), c.get("fecha"), c.get("cliente_nombre"),
+                     c.get("cliente_nit"), c.get("cliente_direccion"), c.get("cliente_telefono"),
+                     c.get("cliente_ciudad"), c.get("contractor_nombre"), c.get("contractor_id"),
+                     c.get("contractor_telefono"), c.get("contractor_email"), c.get("texto_pago"),
+                     float(c.get("total") or 0), c.get("pdf_path")),
+                )
+                row = conn.execute("SELECT id FROM cc_cuentas WHERE remote_id=?", (c.get("id"),)).fetchone()
+                if row:
+                    remote_to_local[int(c["id"])] = int(row["id"])
+            for d in (data.get("detalles") or []):
+                lid = remote_to_local.get(int(d.get("cuenta_id") or 0))
+                if lid is None:
+                    continue
+                conn.execute(
+                    """INSERT INTO cc_detalle (remote_id, cuenta_local_id, fecha_labor, descripcion, valor)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET fecha_labor=excluded.fecha_labor,
+                         descripcion=excluded.descripcion, valor=excluded.valor""",
+                    (d.get("id"), lid, d.get("fecha_labor"), d.get("descripcion"),
+                     float(d.get("valor") or 0)),
+                )
+
+    def mark_cobros_pushed(self):
+        with self.connect() as conn:
+            conn.execute("UPDATE cc_cuentas SET synced=1 WHERE synced=0")
+
+    def cc_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='cobro_op'"
+            ).fetchone()[0])
+
+    def cc_list_cuentas(self, limit=500):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, consecutivo, cliente_nombre, contractor_nombre,
+                          total, pdf_path, fecha, synced
+                   FROM cc_cuentas ORDER BY id DESC LIMIT ?""", (int(limit),))]
+
+    def cc_get_detalle(self, local_id):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT fecha_labor, descripcion, valor
+                   FROM cc_detalle WHERE cuenta_local_id=? ORDER BY id""", (int(local_id),))]
+
+    def cc_get_cuenta(self, local_id):
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT id AS local_id, remote_id, consecutivo, fecha, cliente_nombre, cliente_nit,
+                          cliente_direccion, cliente_telefono, cliente_ciudad, contractor_nombre,
+                          contractor_id, contractor_telefono, contractor_email, texto_pago, total
+                   FROM cc_cuentas WHERE id=?""", (int(local_id),)).fetchone()
+            return dict(row) if row else None
+
+    def cc_crear_cuenta(self, cliente: dict, items: list, user=None):
+        nombre = (cliente.get("cliente_nombre") or "").strip()
+        if not nombre:
+            raise ValueError("El nombre del cliente es obligatorio.")
+        norm_items, total = [], 0.0
+        for it in (items or []):
+            desc = (it.get("descripcion") or "").strip()
+            if not desc:
+                continue
+            valor = float(it.get("valor") or 0)
+            total += valor
+            norm_items.append({"fecha_labor": it.get("fecha_labor") or date.today().isoformat(),
+                               "descripcion": desc, "valor": valor})
+        if not norm_items:
+            raise ValueError("Agrega al menos un ítem con descripción.")
+        op_uuid = _uuid.uuid4().hex
+        # consecutivo provisional local (el servidor asigna el definitivo al sync)
+        with self.connect() as conn:
+            n = int(conn.execute("SELECT COUNT(*) FROM cc_cuentas").fetchone()[0]) + 1
+            consecutivo = f"LOCAL-{n:04d}"
+            cur = conn.execute(
+                """INSERT INTO cc_cuentas
+                    (consecutivo, fecha, cliente_nombre, cliente_nit, cliente_direccion,
+                     cliente_telefono, cliente_ciudad, contractor_nombre, contractor_id,
+                     contractor_telefono, contractor_email, texto_pago, total, synced, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP)""",
+                (consecutivo, date.today().isoformat(), nombre, cliente.get("cliente_nit"),
+                 cliente.get("cliente_direccion"), cliente.get("cliente_telefono"),
+                 cliente.get("cliente_ciudad"), cliente.get("contractor_nombre"),
+                 cliente.get("contractor_id"), cliente.get("contractor_telefono"),
+                 cliente.get("contractor_email"), cliente.get("texto_pago"), total),
+            )
+            local_id = int(cur.lastrowid)
+            for it in norm_items:
+                conn.execute(
+                    "INSERT INTO cc_detalle (cuenta_local_id, fecha_labor, descripcion, valor) VALUES (?,?,?,?)",
+                    (local_id, it["fecha_labor"], it["descripcion"], it["valor"]),
+                )
+            payload = {"op": "create_cuenta", "client_op_uuid": op_uuid, "items": norm_items,
+                       "fecha": date.today().isoformat()}
+            for k in ("cliente_nombre", "cliente_nit", "cliente_direccion", "cliente_telefono",
+                      "cliente_ciudad", "contractor_nombre", "contractor_id", "contractor_telefono",
+                      "contractor_email", "texto_pago"):
+                payload[k] = cliente.get(k)
+            payload["cliente_nombre"] = nombre
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "cobro_op", op_uuid, "create", payload)
+        return local_id
+
+    def cc_eliminar_cuenta(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM cc_cuentas WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Cuenta de cobro no encontrada.")
+            conn.execute("DELETE FROM cc_detalle WHERE cuenta_local_id=?", (int(local_id),))
+            conn.execute("DELETE FROM cc_cuentas WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_cuenta", "cuenta_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "cobro_op", _uuid.uuid4().hex, "create", payload)
+
+    # ─── CRM (espejo + outbox) ────────────────────────────────────
+    _CRM_CONTACTO_COLS = ("tipo", "nombre", "empresa", "cargo", "email", "telefono",
+                          "whatsapp", "sitio_web", "direccion", "ciudad", "notas", "origen")
+
+    def replace_crm_snapshot(self, data: dict):
+        """Reconstruye el espejo CRM; conserva filas locales (synced=0)."""
+        with self.connect() as conn:
+            # Contactos
+            conn.execute("DELETE FROM crm_contactos WHERE synced=1")
+            for c in (data.get("contactos") or []):
+                conn.execute(
+                    """INSERT INTO crm_contactos (remote_id, tipo, nombre, empresa, cargo, email,
+                         telefono, whatsapp, sitio_web, direccion, ciudad, notas, origen, synced, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET tipo=excluded.tipo, nombre=excluded.nombre,
+                         empresa=excluded.empresa, cargo=excluded.cargo, email=excluded.email,
+                         telefono=excluded.telefono, whatsapp=excluded.whatsapp, sitio_web=excluded.sitio_web,
+                         direccion=excluded.direccion, ciudad=excluded.ciudad, notas=excluded.notas,
+                         origen=excluded.origen, synced=1""",
+                    (c.get("id"), c.get("tipo"), c.get("nombre"), c.get("empresa"), c.get("cargo"),
+                     c.get("email"), c.get("telefono"), c.get("whatsapp"), c.get("sitio_web"),
+                     c.get("direccion"), c.get("ciudad"), c.get("notas"), c.get("origen"), c.get("created_at")),
+                )
+            # Actividades
+            conn.execute("DELETE FROM crm_actividades WHERE synced=1")
+            for a in (data.get("actividades") or []):
+                conn.execute(
+                    """INSERT INTO crm_actividades (remote_id, contacto_remote_id, tipo, asunto, descripcion, fecha_actividad, synced)
+                       VALUES (?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET tipo=excluded.tipo, asunto=excluded.asunto,
+                         descripcion=excluded.descripcion, fecha_actividad=excluded.fecha_actividad, synced=1""",
+                    (a.get("id"), a.get("contacto_id"), a.get("tipo"), a.get("asunto"),
+                     a.get("descripcion"), a.get("fecha_actividad")),
+                )
+            # Tareas
+            conn.execute("DELETE FROM crm_tareas WHERE synced=1")
+            for t in (data.get("tareas") or []):
+                conn.execute(
+                    """INSERT INTO crm_tareas (remote_id, contacto_remote_id, titulo, descripcion,
+                         prioridad, estado, fecha_limite, completada_en, synced)
+                       VALUES (?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET titulo=excluded.titulo, descripcion=excluded.descripcion,
+                         prioridad=excluded.prioridad, estado=excluded.estado, fecha_limite=excluded.fecha_limite,
+                         completada_en=excluded.completada_en, synced=1""",
+                    (t.get("id"), t.get("contacto_id"), t.get("titulo"), t.get("descripcion"),
+                     t.get("prioridad"), t.get("estado"), t.get("fecha_limite"), t.get("completada_en")),
+                )
+            # Oportunidades
+            conn.execute("DELETE FROM crm_oportunidades WHERE synced=1")
+            for o in (data.get("oportunidades") or []):
+                conn.execute(
+                    """INSERT INTO crm_oportunidades (remote_id, contacto_remote_id, titulo, descripcion,
+                         monto_estimado, probabilidad, etapa, fecha_cierre_est, synced, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,1,?)
+                       ON CONFLICT(remote_id) DO UPDATE SET titulo=excluded.titulo, descripcion=excluded.descripcion,
+                         monto_estimado=excluded.monto_estimado, probabilidad=excluded.probabilidad,
+                         etapa=excluded.etapa, fecha_cierre_est=excluded.fecha_cierre_est, synced=1""",
+                    (o.get("id"), o.get("contacto_id"), o.get("titulo"), o.get("descripcion"),
+                     float(o.get("monto_estimado") or 0), int(o.get("probabilidad") or 0),
+                     o.get("etapa"), o.get("fecha_cierre_est"), o.get("created_at")),
+                )
+
+    def mark_crm_pushed(self):
+        with self.connect() as conn:
+            for tbl in ("crm_contactos", "crm_actividades", "crm_tareas", "crm_oportunidades"):
+                conn.execute(f"UPDATE {tbl} SET synced=1 WHERE synced=0")
+
+    def crm_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='crm_op'").fetchone()[0])
+
+    def crm_list_contactos(self, tipo=None, limit=2000):
+        sql = """SELECT id AS local_id, remote_id, tipo, nombre, empresa, cargo, email, telefono,
+                        whatsapp, sitio_web, direccion, ciudad, notas, origen, synced
+                 FROM crm_contactos WHERE 1=1"""
+        params = []
+        if tipo:
+            sql += " AND tipo=?"; params.append(tipo)
+        sql += " ORDER BY nombre LIMIT ?"; params.append(int(limit))
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, tuple(params))]
+
+    def crm_list_tareas(self, contacto_remote_id=None, solo_pendientes=False):
+        sql = "SELECT id AS local_id, remote_id, contacto_remote_id, titulo, descripcion, prioridad, estado, fecha_limite, synced FROM crm_tareas WHERE 1=1"
+        params = []
+        if contacto_remote_id is not None:
+            sql += " AND contacto_remote_id=?"; params.append(int(contacto_remote_id))
+        if solo_pendientes:
+            sql += " AND estado='pendiente'"
+        sql += " ORDER BY (estado='completada'), COALESCE(fecha_limite,'9999'), id DESC"
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, tuple(params))]
+
+    def crm_list_oportunidades(self, contacto_remote_id=None):
+        sql = "SELECT id AS local_id, remote_id, contacto_remote_id, titulo, descripcion, monto_estimado, probabilidad, etapa, synced FROM crm_oportunidades WHERE 1=1"
+        params = []
+        if contacto_remote_id is not None:
+            sql += " AND contacto_remote_id=?"; params.append(int(contacto_remote_id))
+        sql += " ORDER BY id DESC"
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, tuple(params))]
+
+    def crm_list_actividades(self, contacto_remote_id):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, tipo, asunto, descripcion, fecha_actividad
+                   FROM crm_actividades WHERE contacto_remote_id=? ORDER BY id DESC LIMIT 100""",
+                (int(contacto_remote_id),))]
+
+    def crm_kpis(self):
+        from datetime import date as _d
+        hoy = _d.today().isoformat()
+        with self.connect() as conn:
+            contactos = conn.execute("SELECT COUNT(*) FROM crm_contactos").fetchone()[0]
+            t_pend = conn.execute("SELECT COUNT(*) FROM crm_tareas WHERE estado='pendiente'").fetchone()[0]
+            t_venc = conn.execute("SELECT COUNT(*) FROM crm_tareas WHERE estado='pendiente' AND fecha_limite IS NOT NULL AND fecha_limite < ?", (hoy,)).fetchone()[0]
+            opp_abiertas = conn.execute("SELECT COUNT(*) FROM crm_oportunidades WHERE etapa NOT IN ('ganada','perdida')").fetchone()[0]
+            pipeline = conn.execute("SELECT COALESCE(SUM(monto_estimado),0) FROM crm_oportunidades WHERE etapa NOT IN ('ganada','perdida')").fetchone()[0]
+        return {"contactos": int(contactos), "tareas_pendientes": int(t_pend),
+                "tareas_vencidas": int(t_venc), "oportunidades_abiertas": int(opp_abiertas),
+                "pipeline": float(pipeline or 0)}
+
+    # ── Operaciones CRM (optimista local + outbox) ──
+    def _crm_contacto_payload(self, data: dict) -> dict:
+        return {k: (data.get(k) or None) for k in self._CRM_CONTACTO_COLS}
+
+    def crm_crear_contacto(self, data: dict, user=None):
+        nombre = (data.get("nombre") or "").strip()
+        if not nombre:
+            raise ValueError("El nombre del contacto es obligatorio.")
+        tipo = (data.get("tipo") or "cliente").strip()
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO crm_contactos (tipo, nombre, empresa, cargo, email, telefono, whatsapp,
+                     sitio_web, direccion, ciudad, notas, origen, synced, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP)""",
+                (tipo, nombre, data.get("empresa"), data.get("cargo"), data.get("email"),
+                 data.get("telefono"), data.get("whatsapp"), data.get("sitio_web"),
+                 data.get("direccion"), data.get("ciudad"), data.get("notas"), "desktop"),
+            )
+            lid = int(cur.lastrowid)
+            payload = {"op": "create_contacto", "client_op_uuid": op_uuid}
+            payload.update(self._crm_contacto_payload(data)); payload["nombre"] = nombre; payload["tipo"] = tipo
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "crm_op", op_uuid, "create", payload)
+        return lid
+
+    def crm_editar_contacto(self, local_id, data: dict, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_contactos WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Contacto no encontrado.")
+            sets = ", ".join(f"{c}=?" for c in self._CRM_CONTACTO_COLS)
+            conn.execute(f"UPDATE crm_contactos SET {sets} WHERE id=?",
+                         tuple(data.get(c) for c in self._CRM_CONTACTO_COLS) + (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "update_contacto", "contacto_id": int(row["remote_id"])}
+                payload.update(self._crm_contacto_payload(data))
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    def crm_eliminar_contacto(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_contactos WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Contacto no encontrado.")
+            conn.execute("DELETE FROM crm_contactos WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_contacto", "contacto_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    def crm_crear_tarea(self, contacto_remote_id, titulo, descripcion="", prioridad="media", fecha_limite=None, user=None):
+        titulo = (titulo or "").strip()
+        if not titulo:
+            raise ValueError("El título de la tarea es obligatorio.")
+        if contacto_remote_id is None:
+            raise ValueError("Sincroniza el contacto antes de agregarle tareas.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO crm_tareas (contacto_remote_id, titulo, descripcion, prioridad, estado, fecha_limite, synced)
+                   VALUES (?,?,?,?, 'pendiente', ?, 0)""",
+                (int(contacto_remote_id), titulo, descripcion or None, prioridad, fecha_limite or None),
+            )
+            payload = {"op": "create_tarea", "client_op_uuid": op_uuid, "contacto_id": int(contacto_remote_id),
+                       "titulo": titulo, "descripcion": descripcion or None, "prioridad": prioridad,
+                       "fecha_limite": fecha_limite or None}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "crm_op", op_uuid, "create", payload)
+
+    def crm_completar_tarea(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_tareas WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Tarea no encontrada.")
+            conn.execute("UPDATE crm_tareas SET estado='completada', completada_en=CURRENT_TIMESTAMP WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "complete_tarea", "tarea_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    def crm_eliminar_tarea(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_tareas WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Tarea no encontrada.")
+            conn.execute("DELETE FROM crm_tareas WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_tarea", "tarea_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    def crm_crear_actividad(self, contacto_remote_id, tipo, asunto, descripcion="", user=None):
+        if contacto_remote_id is None:
+            raise ValueError("Sincroniza el contacto antes de registrar actividades.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO crm_actividades (contacto_remote_id, tipo, asunto, descripcion, fecha_actividad, synced)
+                   VALUES (?,?,?,?,CURRENT_TIMESTAMP,0)""",
+                (int(contacto_remote_id), tipo, (asunto or "Actividad"), descripcion or None),
+            )
+            payload = {"op": "create_actividad", "client_op_uuid": op_uuid, "contacto_id": int(contacto_remote_id),
+                       "tipo": tipo, "asunto": asunto or "Actividad", "descripcion": descripcion or None}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "crm_op", op_uuid, "create", payload)
+
+    def crm_crear_oportunidad(self, contacto_remote_id, titulo, monto_estimado=0, probabilidad=50, etapa="prospecto", descripcion="", user=None):
+        titulo = (titulo or "").strip()
+        if not titulo:
+            raise ValueError("El título de la oportunidad es obligatorio.")
+        if contacto_remote_id is None:
+            raise ValueError("Sincroniza el contacto antes de crear oportunidades.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO crm_oportunidades (contacto_remote_id, titulo, descripcion, monto_estimado, probabilidad, etapa, synced, created_at)
+                   VALUES (?,?,?,?,?,?,0,CURRENT_TIMESTAMP)""",
+                (int(contacto_remote_id), titulo, descripcion or None, float(monto_estimado or 0), int(probabilidad or 50), etapa),
+            )
+            payload = {"op": "create_oportunidad", "client_op_uuid": op_uuid, "contacto_id": int(contacto_remote_id),
+                       "titulo": titulo, "descripcion": descripcion or None, "monto_estimado": float(monto_estimado or 0),
+                       "probabilidad": int(probabilidad or 50), "etapa": etapa}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "crm_op", op_uuid, "create", payload)
+
+    def crm_mover_oportunidad(self, local_id, etapa, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_oportunidades WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Oportunidad no encontrada.")
+            conn.execute("UPDATE crm_oportunidades SET etapa=? WHERE id=?", (etapa, int(local_id)))
+            if row["remote_id"] is not None:
+                payload = {"op": "move_oportunidad", "oportunidad_id": int(row["remote_id"]), "etapa": etapa}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    def crm_eliminar_oportunidad(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM crm_oportunidades WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Oportunidad no encontrada.")
+            conn.execute("DELETE FROM crm_oportunidades WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_oportunidad", "oportunidad_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "crm_op", _uuid.uuid4().hex, "create", payload)
+
+    # ─── Nómina (espejo + outbox) ─────────────────────────────────
+    _N_EMP_COLS = ("tipo_documento", "numero_documento", "nombres", "apellidos", "email",
+                   "telefono", "direccion", "fecha_ingreso", "fecha_retiro", "tipo_vinculacion",
+                   "cargo", "salario_base", "nivel_arl", "banco", "tipo_cuenta", "numero_cuenta",
+                   "eps", "fondo_pension", "fondo_cesantias")
+
+    def replace_nomina_snapshot(self, data: dict):
+        """Reconstruye el espejo de nómina; conserva filas locales (synced=0)."""
+        with self.connect() as conn:
+            # Empleados
+            conn.execute("DELETE FROM n_empleados WHERE synced=1")
+            for e in (data.get("empleados") or []):
+                conn.execute(
+                    """INSERT INTO n_empleados (remote_id, tipo_documento, numero_documento, nombres,
+                         apellidos, email, telefono, direccion, fecha_ingreso, fecha_retiro,
+                         tipo_vinculacion, cargo, salario_base, nivel_arl, banco, tipo_cuenta,
+                         numero_cuenta, eps, fondo_pension, fondo_cesantias, activo, synced)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET tipo_documento=excluded.tipo_documento,
+                         numero_documento=excluded.numero_documento, nombres=excluded.nombres,
+                         apellidos=excluded.apellidos, email=excluded.email, telefono=excluded.telefono,
+                         direccion=excluded.direccion, fecha_ingreso=excluded.fecha_ingreso,
+                         fecha_retiro=excluded.fecha_retiro, tipo_vinculacion=excluded.tipo_vinculacion,
+                         cargo=excluded.cargo, salario_base=excluded.salario_base, nivel_arl=excluded.nivel_arl,
+                         banco=excluded.banco, tipo_cuenta=excluded.tipo_cuenta, numero_cuenta=excluded.numero_cuenta,
+                         eps=excluded.eps, fondo_pension=excluded.fondo_pension,
+                         fondo_cesantias=excluded.fondo_cesantias, activo=excluded.activo, synced=1""",
+                    (e.get("id"), e.get("tipo_documento"), e.get("numero_documento"), e.get("nombres"),
+                     e.get("apellidos"), e.get("email"), e.get("telefono"), e.get("direccion"),
+                     e.get("fecha_ingreso"), e.get("fecha_retiro"), e.get("tipo_vinculacion") or "EMPLEADO",
+                     e.get("cargo"), float(e.get("salario_base") or 0), e.get("nivel_arl") or "I",
+                     e.get("banco"), e.get("tipo_cuenta"), e.get("numero_cuenta"), e.get("eps"),
+                     e.get("fondo_pension"), e.get("fondo_cesantias"), 1 if e.get("activo", True) else 0),
+                )
+            # Parámetros (server autoritativo; reemplazo total)
+            for p in (data.get("parametros") or []):
+                conn.execute(
+                    """INSERT INTO n_parametros (anio, salario_minimo, auxilio_transporte, uvt)
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(anio) DO UPDATE SET salario_minimo=excluded.salario_minimo,
+                         auxilio_transporte=excluded.auxilio_transporte, uvt=excluded.uvt""",
+                    (int(p.get("anio")), float(p.get("salario_minimo") or 0),
+                     float(p.get("auxilio_transporte") or 0), float(p.get("uvt") or 0)),
+                )
+            # Períodos
+            conn.execute("DELETE FROM n_periodos WHERE synced=1")
+            for pe in (data.get("periodos") or []):
+                conn.execute(
+                    """INSERT INTO n_periodos (remote_id, anio, mes, numero_periodo, fecha_inicio,
+                         fecha_fin, observaciones, estado_local, synced)
+                       VALUES (?,?,?,?,?,?,?, 'liquidado', 1)
+                       ON CONFLICT(remote_id) DO UPDATE SET anio=excluded.anio, mes=excluded.mes,
+                         numero_periodo=excluded.numero_periodo, fecha_inicio=excluded.fecha_inicio,
+                         fecha_fin=excluded.fecha_fin, observaciones=excluded.observaciones, synced=1""",
+                    (pe.get("id"), int(pe.get("anio") or 0), pe.get("mes"), pe.get("numero_periodo"),
+                     pe.get("fecha_inicio"), pe.get("fecha_fin"), pe.get("observaciones")),
+                )
+            # Detalle (mapear periodo remoto -> local)
+            per_map = {r["remote_id"]: r["id"] for r in conn.execute(
+                "SELECT id, remote_id FROM n_periodos WHERE remote_id IS NOT NULL")}
+            conn.execute("DELETE FROM n_detalle WHERE synced=1")
+            for d in (data.get("detalle") or []):
+                lid = per_map.get(d.get("periodo_id"))
+                if lid is None:
+                    continue
+                conn.execute(
+                    """INSERT INTO n_detalle (remote_id, periodo_local_id, empleado_remote_id, dias_trabajados,
+                         sueldo_basico, auxilio_transporte, horas_extras, total_devengado, salud_empleado,
+                         pension_empleado, fondo_solidaridad, retencion_fuente, total_deducido, neto_pagar, synced)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET total_devengado=excluded.total_devengado,
+                         total_deducido=excluded.total_deducido, neto_pagar=excluded.neto_pagar, synced=1""",
+                    (d.get("id"), lid, d.get("empleado_id"), int(d.get("dias_trabajados") or 0),
+                     float(d.get("sueldo_basico") or 0), float(d.get("auxilio_transporte") or 0),
+                     float(d.get("horas_extras") or 0), float(d.get("total_devengado") or 0),
+                     float(d.get("salud_empleado") or 0), float(d.get("pension_empleado") or 0),
+                     float(d.get("fondo_solidaridad") or 0), float(d.get("retencion_fuente") or 0),
+                     float(d.get("total_deducido") or 0), float(d.get("neto_pagar") or 0)),
+                )
+            # Novedades
+            conn.execute("DELETE FROM n_novedades WHERE synced=1")
+            for nv in (data.get("novedades") or []):
+                conn.execute(
+                    """INSERT INTO n_novedades (remote_id, periodo_remote_id, empleado_remote_id,
+                         tipo_novedad, cantidad, valor_total, fecha_novedad, observacion, synced)
+                       VALUES (?,?,?,?,?,?,?,?,1)
+                       ON CONFLICT(remote_id) DO UPDATE SET cantidad=excluded.cantidad,
+                         valor_total=excluded.valor_total, observacion=excluded.observacion, synced=1""",
+                    (nv.get("id"), nv.get("periodo_id"), nv.get("empleado_id"), nv.get("tipo_novedad"),
+                     float(nv.get("cantidad") or 0), float(nv.get("valor_total") or 0),
+                     nv.get("fecha_novedad"), nv.get("observacion")),
+                )
+
+    def mark_nomina_pushed(self):
+        with self.connect() as conn:
+            for tbl in ("n_empleados", "n_periodos", "n_detalle", "n_novedades"):
+                conn.execute(f"UPDATE {tbl} SET synced=1 WHERE synced=0")
+
+    def n_pending_count(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE synced_at IS NULL AND entity='nomina_op'").fetchone()[0])
+
+    def n_list_empleados(self, incluir_inactivos=False):
+        sql = """SELECT id AS local_id, remote_id, tipo_documento, numero_documento, nombres, apellidos,
+                        email, telefono, direccion, fecha_ingreso, fecha_retiro, tipo_vinculacion, cargo,
+                        salario_base, nivel_arl, banco, tipo_cuenta, numero_cuenta, eps, fondo_pension,
+                        fondo_cesantias, activo, synced
+                 FROM n_empleados WHERE 1=1"""
+        if not incluir_inactivos:
+            sql += " AND activo=1"
+        sql += " ORDER BY nombres, apellidos"
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql)]
+
+    def n_get_empleado(self, local_id):
+        with self.connect() as conn:
+            r = conn.execute("SELECT *, id AS local_id FROM n_empleados WHERE id=?", (int(local_id),)).fetchone()
+            return dict(r) if r else None
+
+    def n_get_parametros(self, anio):
+        """Parámetros del año desde la tabla local; si no hay, usa los oficiales
+        portados (offline-first). Devuelve dict salario_minimo/auxilio_transporte/uvt."""
+        anio = int(anio)
+        with self.connect() as conn:
+            r = conn.execute("SELECT anio, salario_minimo, auxilio_transporte, uvt FROM n_parametros WHERE anio=?", (anio,)).fetchone()
+        if r and float(r["salario_minimo"] or 0) > 0:
+            return dict(r)
+        import nomina_calc
+        of = nomina_calc.PARAMETROS_OFICIALES_NOMINA.get(anio)
+        if of:
+            return {"anio": anio, "salario_minimo": of["salario_minimo"],
+                    "auxilio_transporte": of["auxilio_transporte"], "uvt": of["uvt"]}
+        return {"anio": anio, "salario_minimo": 0, "auxilio_transporte": 0, "uvt": 0}
+
+    def n_list_periodos(self):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, anio, mes, numero_periodo, fecha_inicio, fecha_fin,
+                          observaciones, estado_local, synced
+                   FROM n_periodos ORDER BY anio DESC, COALESCE(mes,0) DESC, COALESCE(numero_periodo,0) DESC, id DESC""")]
+
+    def n_get_periodo(self, local_id):
+        with self.connect() as conn:
+            r = conn.execute("SELECT *, id AS local_id FROM n_periodos WHERE id=?", (int(local_id),)).fetchone()
+            return dict(r) if r else None
+
+    def n_list_novedades(self, periodo_remote_id):
+        if periodo_remote_id is None:
+            return []
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, periodo_remote_id, empleado_remote_id, tipo_novedad,
+                          cantidad, valor_total, fecha_novedad, observacion, synced
+                   FROM n_novedades WHERE periodo_remote_id=? ORDER BY id DESC""", (int(periodo_remote_id),))]
+
+    def n_list_detalle(self, periodo_local_id):
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id AS local_id, remote_id, empleado_remote_id, dias_trabajados, sueldo_basico,
+                          auxilio_transporte, horas_extras, total_devengado, salud_empleado, pension_empleado,
+                          fondo_solidaridad, retencion_fuente, total_deducido, neto_pagar, synced
+                   FROM n_detalle WHERE periodo_local_id=? ORDER BY id""", (int(periodo_local_id),))]
+
+    # ── Operaciones nómina (optimista local + outbox) ──
+    def _n_emp_payload(self, data):
+        return {k: data.get(k) for k in self._N_EMP_COLS}
+
+    def n_crear_empleado(self, data, user=None):
+        nombres = (data.get("nombres") or "").strip()
+        if not nombres:
+            raise ValueError("Los nombres son obligatorios.")
+        if float(data.get("salario_base") or 0) <= 0:
+            raise ValueError("El salario base debe ser mayor a cero.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            cols = ", ".join(self._N_EMP_COLS)
+            ph = ", ".join("?" for _ in self._N_EMP_COLS)
+            cur = conn.execute(
+                f"INSERT INTO n_empleados ({cols}, activo, synced) VALUES ({ph}, 1, 0)",
+                tuple(data.get(c) for c in self._N_EMP_COLS),
+            )
+            lid = int(cur.lastrowid)
+            payload = {"op": "create_empleado", "client_op_uuid": op_uuid}
+            payload.update(self._n_emp_payload(data))
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "nomina_op", op_uuid, "create", payload)
+        return lid
+
+    def n_editar_empleado(self, local_id, data, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM n_empleados WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Empleado no encontrado.")
+            sets = ", ".join(f"{c}=?" for c in self._N_EMP_COLS)
+            conn.execute(f"UPDATE n_empleados SET {sets} WHERE id=?",
+                         tuple(data.get(c) for c in self._N_EMP_COLS) + (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "update_empleado", "empleado_id": int(row["remote_id"])}
+                payload.update(self._n_emp_payload(data))
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "nomina_op", _uuid.uuid4().hex, "create", payload)
+
+    def n_eliminar_empleado(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM n_empleados WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Empleado no encontrado.")
+            conn.execute("UPDATE n_empleados SET activo=0 WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_empleado", "empleado_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "nomina_op", _uuid.uuid4().hex, "create", payload)
+
+    def n_crear_periodo(self, anio, mes, numero_periodo, fecha_inicio, fecha_fin, observaciones="", user=None):
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO n_periodos (anio, mes, numero_periodo, fecha_inicio, fecha_fin,
+                     observaciones, estado_local, synced) VALUES (?,?,?,?,?,?, 'borrador', 0)""",
+                (int(anio), int(mes), int(numero_periodo), fecha_inicio, fecha_fin, observaciones or None),
+            )
+            lid = int(cur.lastrowid)
+            payload = {"op": "create_periodo", "client_op_uuid": op_uuid, "anio": int(anio), "mes": int(mes),
+                       "numero_periodo": int(numero_periodo), "fecha_inicio": fecha_inicio,
+                       "fecha_fin": fecha_fin, "observaciones": observaciones or None}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "nomina_op", op_uuid, "create", payload)
+        return lid
+
+    def n_crear_novedad(self, periodo_remote_id, empleado_remote_id, tipo_novedad, cantidad, valor_total,
+                        fecha_novedad=None, observacion="", user=None):
+        if periodo_remote_id is None or empleado_remote_id is None:
+            raise ValueError("Sincroniza el período y el empleado antes de registrar novedades.")
+        op_uuid = _uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO n_novedades (periodo_remote_id, empleado_remote_id, tipo_novedad, cantidad,
+                     valor_total, fecha_novedad, observacion, synced) VALUES (?,?,?,?,?,?,?,0)""",
+                (int(periodo_remote_id), int(empleado_remote_id), tipo_novedad, float(cantidad or 0),
+                 float(valor_total or 0), fecha_novedad, observacion or None),
+            )
+            payload = {"op": "create_novedad", "client_op_uuid": op_uuid,
+                       "periodo_id": int(periodo_remote_id), "empleado_id": int(empleado_remote_id),
+                       "tipo_novedad": tipo_novedad, "cantidad": float(cantidad or 0),
+                       "valor_total": float(valor_total or 0), "fecha_novedad": fecha_novedad,
+                       "observacion": observacion or None}
+            payload.update(self._rt_user_fields(user))
+            self._queue_outbox(conn, "nomina_op", op_uuid, "create", payload)
+
+    def n_eliminar_novedad(self, local_id, user=None):
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM n_novedades WHERE id=?", (int(local_id),)).fetchone()
+            if not row:
+                raise ValueError("Novedad no encontrada.")
+            conn.execute("DELETE FROM n_novedades WHERE id=?", (int(local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "delete_novedad", "novedad_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "nomina_op", _uuid.uuid4().hex, "create", payload)
+
+    def n_guardar_liquidacion(self, periodo_local_id, detalles, user=None):
+        """Persiste localmente la liquidación calculada (synced=0) y encola la
+        solicitud para que el servidor recalcule con el MISMO motor al sincronizar."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT remote_id FROM n_periodos WHERE id=?", (int(periodo_local_id),)).fetchone()
+            if not row:
+                raise ValueError("Período no encontrado.")
+            conn.execute("DELETE FROM n_detalle WHERE periodo_local_id=? AND synced=0", (int(periodo_local_id),))
+            for d in detalles:
+                conn.execute(
+                    """INSERT INTO n_detalle (periodo_local_id, empleado_remote_id, dias_trabajados,
+                         sueldo_basico, auxilio_transporte, horas_extras, total_devengado, salud_empleado,
+                         pension_empleado, fondo_solidaridad, retencion_fuente, total_deducido, neto_pagar, synced)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    (int(periodo_local_id), d.get("empleado_id"), int(d.get("dias_trabajados") or 0),
+                     d.get("sueldo_basico"), d.get("auxilio_transporte"), d.get("horas_extras"),
+                     d.get("total_devengado"), d.get("salud_empleado"), d.get("pension_empleado"),
+                     d.get("fondo_solidaridad"), d.get("retencion_fuente"), d.get("total_deducido"),
+                     d.get("neto_pagar")),
+                )
+            conn.execute("UPDATE n_periodos SET estado_local='liquidado' WHERE id=?", (int(periodo_local_id),))
+            if row["remote_id"] is not None:
+                payload = {"op": "calcular_periodo", "periodo_id": int(row["remote_id"])}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "nomina_op", _uuid.uuid4().hex, "create", payload)
+
     def cb_categorias(self):
         with self.connect() as conn:
             rows = conn.execute("SELECT DISTINCT categoria FROM cb_movimientos WHERE categoria IS NOT NULL ORDER BY categoria").fetchall()
@@ -1637,14 +2503,10 @@ class LocalStore:
         if not email:
             raise ValueError("usuario remoto sin email")
         nombre = (remote.get("nombre") or remote.get("name") or email).strip()
-        rol = (remote.get("rol_nombre") or remote.get("role") or "Cajero").strip()
-        # Mapeo de rol web -> rol desktop
-        if rol.lower() in ("admin", "administrador"):
-            rol = "Administrador"
-        elif rol.lower() in ("cajero", "vendedor"):
-            rol = "Cajero"
-        else:
-            rol = "Cajero"
+        # Mapeo de rol web -> rol desktop preservando los 6 roles (rol_id es
+        # autoritativo; cae a rol_nombre/role). Necesario para que el manifiesto
+        # de permisos se aplique al rol correcto (Empleado/Contador/Mesero, etc.).
+        rol = map_role(remote.get("rol_id"), remote.get("rol_nombre") or remote.get("role"))
         estado = (remote.get("estado") or "habilitado").strip().lower()
         active = 0 if estado in ("deshabilitado", "eliminado") else 1
         remote_id = remote.get("remote_id")
@@ -1997,6 +2859,193 @@ class LocalStore:
 
                 CREATE INDEX IF NOT EXISTS idx_cb_mov_fecha ON cb_movimientos(fecha, tipo);
                 CREATE INDEX IF NOT EXISTS idx_cb_mov_cat ON cb_movimientos(categoria);
+
+                CREATE TABLE IF NOT EXISTS q_cotizaciones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    cliente_nombre TEXT NOT NULL,
+                    cliente_documento TEXT,
+                    cliente_direccion TEXT,
+                    cliente_ciudad TEXT,
+                    cliente_telefono TEXT,
+                    cliente_representante TEXT,
+                    cliente_cargo TEXT,
+                    cliente_localidad TEXT,
+                    total REAL NOT NULL DEFAULT 0,
+                    estado TEXT NOT NULL DEFAULT 'pendiente',
+                    pdf_path TEXT,
+                    fecha TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS q_detalle (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    cotizacion_local_id INTEGER NOT NULL,
+                    descripcion TEXT,
+                    cantidad INTEGER NOT NULL DEFAULT 1,
+                    precio_unitario REAL NOT NULL DEFAULT 0,
+                    subtotal REAL NOT NULL DEFAULT 0,
+                    descuento_porc REAL NOT NULL DEFAULT 0,
+                    iva_porc REAL NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_q_det_cot ON q_detalle(cotizacion_local_id);
+
+                CREATE TABLE IF NOT EXISTS cc_cuentas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    consecutivo TEXT,
+                    fecha TEXT,
+                    cliente_nombre TEXT NOT NULL,
+                    cliente_nit TEXT,
+                    cliente_direccion TEXT,
+                    cliente_telefono TEXT,
+                    cliente_ciudad TEXT,
+                    contractor_nombre TEXT,
+                    contractor_id TEXT,
+                    contractor_telefono TEXT,
+                    contractor_email TEXT,
+                    texto_pago TEXT,
+                    total REAL NOT NULL DEFAULT 0,
+                    pdf_path TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS cc_detalle (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    cuenta_local_id INTEGER NOT NULL,
+                    fecha_labor TEXT,
+                    descripcion TEXT,
+                    valor REAL NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cc_det_cuenta ON cc_detalle(cuenta_local_id);
+
+                CREATE TABLE IF NOT EXISTS crm_contactos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    tipo TEXT NOT NULL DEFAULT 'cliente',
+                    nombre TEXT NOT NULL,
+                    empresa TEXT, cargo TEXT, email TEXT, telefono TEXT, whatsapp TEXT,
+                    sitio_web TEXT, direccion TEXT, ciudad TEXT, notas TEXT, origen TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS crm_actividades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    contacto_remote_id INTEGER,
+                    tipo TEXT, asunto TEXT, descripcion TEXT, fecha_actividad TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS crm_tareas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    contacto_remote_id INTEGER,
+                    titulo TEXT NOT NULL, descripcion TEXT,
+                    prioridad TEXT NOT NULL DEFAULT 'media',
+                    estado TEXT NOT NULL DEFAULT 'pendiente',
+                    fecha_limite TEXT, completada_en TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS crm_oportunidades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    contacto_remote_id INTEGER,
+                    titulo TEXT NOT NULL, descripcion TEXT,
+                    monto_estimado REAL NOT NULL DEFAULT 0,
+                    probabilidad INTEGER NOT NULL DEFAULT 50,
+                    etapa TEXT NOT NULL DEFAULT 'prospecto',
+                    fecha_cierre_est TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_crm_act_cont ON crm_actividades(contacto_remote_id);
+                CREATE INDEX IF NOT EXISTS idx_crm_tar_cont ON crm_tareas(contacto_remote_id);
+                CREATE INDEX IF NOT EXISTS idx_crm_opo_cont ON crm_oportunidades(contacto_remote_id);
+
+                CREATE TABLE IF NOT EXISTS n_empleados (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    tipo_documento TEXT, numero_documento TEXT,
+                    nombres TEXT NOT NULL, apellidos TEXT,
+                    email TEXT, telefono TEXT, direccion TEXT,
+                    fecha_ingreso TEXT, fecha_retiro TEXT,
+                    tipo_vinculacion TEXT NOT NULL DEFAULT 'EMPLEADO',
+                    cargo TEXT, salario_base REAL NOT NULL DEFAULT 0,
+                    nivel_arl TEXT DEFAULT 'I',
+                    banco TEXT, tipo_cuenta TEXT, numero_cuenta TEXT,
+                    eps TEXT, fondo_pension TEXT, fondo_cesantias TEXT,
+                    activo INTEGER NOT NULL DEFAULT 1,
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS n_parametros (
+                    anio INTEGER PRIMARY KEY,
+                    salario_minimo REAL NOT NULL DEFAULT 0,
+                    auxilio_transporte REAL NOT NULL DEFAULT 0,
+                    uvt REAL NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS n_periodos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    anio INTEGER NOT NULL, mes INTEGER, numero_periodo INTEGER,
+                    fecha_inicio TEXT, fecha_fin TEXT, observaciones TEXT,
+                    estado_local TEXT NOT NULL DEFAULT 'borrador',
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS n_detalle (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    periodo_local_id INTEGER NOT NULL,
+                    empleado_remote_id INTEGER,
+                    dias_trabajados INTEGER DEFAULT 0,
+                    sueldo_basico REAL DEFAULT 0, auxilio_transporte REAL DEFAULT 0,
+                    horas_extras REAL DEFAULT 0, total_devengado REAL DEFAULT 0,
+                    salud_empleado REAL DEFAULT 0, pension_empleado REAL DEFAULT 0,
+                    fondo_solidaridad REAL DEFAULT 0, retencion_fuente REAL DEFAULT 0,
+                    total_deducido REAL DEFAULT 0, neto_pagar REAL DEFAULT 0,
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS n_novedades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id INTEGER UNIQUE,
+                    periodo_remote_id INTEGER,
+                    empleado_remote_id INTEGER,
+                    tipo_novedad TEXT NOT NULL,
+                    cantidad REAL NOT NULL DEFAULT 0,
+                    valor_total REAL DEFAULT 0,
+                    fecha_novedad TEXT, observacion TEXT,
+                    synced INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_n_det_per ON n_detalle(periodo_local_id);
+                CREATE INDEX IF NOT EXISTS idx_n_nov_per ON n_novedades(periodo_remote_id);
+                """
+            )
+
+            # ── IA: historial de chat local (persistente, solo lectura offline) ──
+            # y operaciones de outbox RECHAZADas por el servidor (licencia/rol),
+            # para no reintentarlas indefinidamente y mostrarlas al usuario.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ia_chat (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rol TEXT NOT NULL,          -- 'user' | 'assistant'
+                    texto TEXT NOT NULL,
+                    herramienta TEXT,           -- tool usada por la IA (opcional)
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_ia_chat_created ON ia_chat(created_at);
+
+                CREATE TABLE IF NOT EXISTS sync_rejections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity TEXT, action TEXT,
+                    motivo TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                );
                 """
             )
 
@@ -2022,6 +3071,97 @@ class LocalStore:
         """Persiste los flags de módulos del plan para gating offline."""
         with self.connect() as conn:
             self._set_meta(conn, "tenant_modules", json.dumps(flags, ensure_ascii=True))
+
+    def get_permissions_manifest(self):
+        """Manifiesto de permisos rol → {modules, actions} cacheado, o None si
+        nunca se cacheó (el caller hace fail-open al gating por rol local)."""
+        with self.connect() as conn:
+            raw = self._get_meta(conn, "permissions_manifest")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    def set_permissions_manifest(self, manifest: dict) -> None:
+        """Persiste el manifiesto de permisos para gating offline por rol+acción."""
+        with self.connect() as conn:
+            self._set_meta(conn, "permissions_manifest", json.dumps(manifest, ensure_ascii=True))
+
+    # ── IA: historial de chat local ─────────────────────────────
+    def ia_add_message(self, rol: str, texto: str, herramienta: str | None = None) -> None:
+        """Guarda un turno del chat (rol='user'|'assistant'). No lanza."""
+        if not (texto or "").strip():
+            return
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    "INSERT INTO ia_chat(rol, texto, herramienta) VALUES(?, ?, ?)",
+                    (rol, texto, herramienta),
+                )
+        except Exception:
+            pass
+
+    def ia_recent(self, limit: int = 40) -> list:
+        """Últimos mensajes del chat, en orden cronológico ascendente."""
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT rol, texto, herramienta, created_at FROM ia_chat "
+                    "ORDER BY id DESC LIMIT ?", (int(limit),),
+                ).fetchall()
+            return [dict(r) for r in reversed(rows)]
+        except Exception:
+            return []
+
+    def ia_clear(self) -> None:
+        """Borra el historial de chat local."""
+        try:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM ia_chat")
+        except Exception:
+            pass
+
+    # ── Sync: operaciones rechazadas por el servidor (licencia/rol) ──
+    def record_rejections(self, rejections: list) -> None:
+        """Persiste rechazos {entity, action, motivo} para mostrarlos en Sync."""
+        if not rejections:
+            return
+        try:
+            with self.connect() as conn:
+                conn.executemany(
+                    "INSERT INTO sync_rejections(entity, action, motivo) VALUES(?, ?, ?)",
+                    [(r.get("entity"), r.get("action"), (r.get("motivo") or "")[:200]) for r in rejections],
+                )
+        except Exception:
+            pass
+
+    def get_rejections(self, limit: int = 50) -> list:
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, entity, action, motivo, created_at FROM sync_rejections "
+                    "ORDER BY id DESC LIMIT ?", (int(limit),),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def rejections_count(self) -> int:
+        try:
+            with self.connect() as conn:
+                return conn.execute("SELECT COUNT(*) FROM sync_rejections").fetchone()[0]
+        except Exception:
+            return 0
+
+    def clear_rejections(self) -> None:
+        try:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM sync_rejections")
+        except Exception:
+            pass
 
     def _get_meta(self, conn, key, default=None):
         row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
