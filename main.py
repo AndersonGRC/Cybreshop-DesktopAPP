@@ -7979,6 +7979,7 @@ _IA_SUGERENCIAS = [
     "¿Cuánto vendí este mes?",
     "¿Qué productos tienen poco stock?",
     "¿Cuáles son mis productos más vendidos?",
+    "¿Qué debo comprar esta semana?",
     "¿Qué pedidos están por despachar?",
 ]
 
