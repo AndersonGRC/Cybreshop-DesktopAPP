@@ -61,7 +61,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.0.3"
+APP_VERSION = "1.0.0.4"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
