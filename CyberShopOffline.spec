@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+# reportlab genera el código de barras Code128 de las etiquetas. Sus codecs de
+# barcode se cargan dinámicamente (getCodes) y trae archivos de datos propios,
+# por lo que hay que recolectar TODO el paquete o el .exe empaquetado falla al
+# imprimir la etiqueta ("Code128 not found" / faltan datos de reportlab).
+from PyInstaller.utils.hooks import collect_all
+
+_rl_datas, _rl_binaries, _rl_hidden = collect_all('reportlab')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('assets/cybershop.ico', 'assets'), ('assets/cybershop.png', 'assets')],
-    hiddenimports=[],
+    binaries=_rl_binaries,
+    datas=[('assets/cybershop.ico', 'assets'), ('assets/cybershop.png', 'assets')] + _rl_datas,
+    hiddenimports=_rl_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
