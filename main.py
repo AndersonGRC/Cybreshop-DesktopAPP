@@ -61,7 +61,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.0.5"
+APP_VERSION = "1.0.1.0"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
@@ -1902,6 +1902,80 @@ class DashboardPage(QWidget):
 # =============================================================================
 # Productos
 # =============================================================================
+def _code128_svg(value, *, bar_height=52.0, target_width=176.0, min_bar_width=0.7):
+    """Devuelve un <svg> Code128 (vector) para la etiqueta. reportlab calcula el
+    dígito de control, así la pistola lo lee sin dificultad. Ajusta el ancho de
+    barra para que quepa sin distorsionar el aspecto (clave para el lector)."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    from reportlab.graphics.barcode import createBarcodeDrawing
+    from reportlab.graphics import renderSVG
+    d = createBarcodeDrawing('Code128', value=value, barHeight=bar_height,
+                             barWidth=1.0, humanReadable=False, quiet=True)
+    if d.width > target_width:
+        bw = max(min_bar_width, target_width / d.width)
+        d = createBarcodeDrawing('Code128', value=value, barHeight=bar_height,
+                                 barWidth=bw, humanReadable=False, quiet=True)
+    svg = renderSVG.drawToString(d)
+    i = svg.find('<svg')
+    return svg[i:] if i != -1 else svg
+
+
+def _gen_unique_code(existing):
+    """Genera un código Code128 único ('CS' + base36 del timestamp) que no colisiona
+    con los códigos/SKU ya presentes en `existing` (set de strings en MAYÚSCULAS)."""
+    import time
+    import random
+    alfa = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+    def b36(n):
+        s = ''
+        while n:
+            s = alfa[n % 36] + s
+            n //= 36
+        return s or '0'
+
+    cand = 'CS' + b36(int(time.time() * 10) % (36 ** 6)) + alfa[random.randrange(36)]
+    for _ in range(50):
+        if cand.upper() not in existing:
+            return cand
+        cand = 'CS' + b36(int(time.time() * 10) % (36 ** 6)) + alfa[random.randrange(36)] + alfa[random.randrange(36)]
+    return cand
+
+
+class LabelQtyDialog(QDialog):
+    """Pregunta cuántas etiquetas imprimir (1 = individual · varias = hoja láser)."""
+
+    def __init__(self, parent, nombre):
+        super().__init__(parent)
+        self.setWindowTitle("Imprimir etiqueta")
+        self.setMinimumWidth(340)
+        v = QVBoxLayout(self)
+        lbl = QLabel(f"Producto: <b>{nombre}</b>")
+        lbl.setWordWrap(True)
+        v.addWidget(lbl)
+        form = QFormLayout()
+        self.qty = QSpinBox()
+        self.qty.setRange(1, 200)
+        self.qty.setValue(1)
+        form.addRow("Cantidad de etiquetas:", self.qty)
+        v.addLayout(form)
+        hint = QLabel("1 = etiqueta individual · varias = hoja de etiquetas (impresora láser)")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Imprimir")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def value(self):
+        return int(self.qty.value())
+
+
 class ProductsPage(QWidget):
     def __init__(self, store: LocalStore, on_changed, can_callback=None):
         super().__init__()
@@ -2019,6 +2093,14 @@ class ProductsPage(QWidget):
         self.new_btn = QPushButton("＋  Nuevo")
         self.new_btn.setObjectName("secondaryAction")
         self.new_btn.clicked.connect(self._clear_form)
+        self.gen_code_btn = QPushButton("⚡  Generar código")
+        self.gen_code_btn.setObjectName("secondaryAction")
+        self.gen_code_btn.setToolTip("Genera un código de barras único cuando el producto no trae uno")
+        self.gen_code_btn.clicked.connect(self._generar_codigo)
+        self.print_label_btn = QPushButton("🏷  Imprimir etiqueta")
+        self.print_label_btn.setObjectName("secondaryAction")
+        self.print_label_btn.setToolTip("Imprime la etiqueta (nombre, código de barras y precio) en impresora láser")
+        self.print_label_btn.clicked.connect(self._imprimir_etiqueta)
         self.delete_btn = QPushButton("⊘  Desactivar")
         self.delete_btn.setObjectName("dangerAction")
         self.delete_btn.clicked.connect(self._delete)
@@ -2028,6 +2110,8 @@ class ProductsPage(QWidget):
         self.save_btn.setVisible(self.can("products", "create") or self.can("products", "edit"))
         actions.addWidget(self.save_btn)
         actions.addWidget(self.new_btn)
+        actions.addWidget(self.gen_code_btn)
+        actions.addWidget(self.print_label_btn)
         actions.addWidget(self.delete_btn)
         actions.addStretch(1)
         self.live_badge = QLabel("●  VPS EN VIVO · SOLO LECTURA")
@@ -2222,6 +2306,126 @@ class ProductsPage(QWidget):
         self.editor_title.setText("NUEVO PRODUCTO")
         self.editor_title.setStyleSheet("")
 
+    # ── Código de barras + etiqueta ──
+    def _generar_codigo(self):
+        """Rellena el campo 'Código de barras' con un código único cuando el
+        producto no trae uno. Evita colisiones con los códigos/SKU ya existentes."""
+        existing = set()
+        for p in (self._all_products or []):
+            for k in ("barcode", "sku"):
+                v = (p.get(k) or "").strip().upper()
+                if v:
+                    existing.add(v)
+        code = _gen_unique_code(existing)
+        self.barcode.setText(code)
+        self.barcode.setFocus()
+
+    def _imprimir_etiqueta(self):
+        """Imprime la etiqueta del producto en edición (nombre arriba, código de
+        barras al centro y precio abajo). Usa el código de barras o, si no hay, el SKU."""
+        nombre = self.name.text().strip()
+        codigo = (self.barcode.text().strip() or self.sku.text().strip())
+        if not nombre or not codigo:
+            QMessageBox.information(
+                self, "Etiqueta",
+                "Escribe al menos el nombre y un código de barras (o SKU) antes de imprimir.\n"
+                "Si el producto no trae código, usa 'Generar código'.")
+            return
+        dlg = LabelQtyDialog(self, nombre)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._print_labels(nombre, self.price.value(), codigo, dlg.value())
+        except Exception as exc:
+            QMessageBox.warning(self, "Etiqueta", f"No se pudo imprimir la etiqueta:\n{exc}")
+
+    def _print_labels(self, nombre, precio, codigo, cantidad):
+        from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
+        from PyQt6.QtGui import QPainter
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QByteArray, QRectF
+
+        svg = _code128_svg(codigo)
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8"))) if svg else None
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle("Imprimir etiquetas")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        painter = QPainter()
+        if not painter.begin(printer):
+            raise RuntimeError("no se pudo iniciar la impresión")
+        try:
+            dpi = printer.resolution()
+            mm = dpi / 25.4
+            page = QRectF(printer.pageLayout().paintRectPixels(dpi))
+            lw, lh = 62 * mm, 40 * mm
+            cols = max(1, int(page.width() // lw))
+            rows = max(1, int(page.height() // lh))
+            per_page = cols * rows
+            precio_txt = ("$" + "{:,.0f}".format(round(float(precio or 0)))).replace(",", ".")
+            for i in range(cantidad):
+                if i > 0 and i % per_page == 0:
+                    printer.newPage()
+                idx = i % per_page
+                x = page.left() + (idx % cols) * lw
+                y = page.top() + (idx // cols) * lh
+                self._draw_label(painter, renderer, QRectF(x, y, lw, lh),
+                                 nombre, codigo, precio_txt, mm)
+        finally:
+            painter.end()
+
+    def _draw_label(self, painter, renderer, rect, nombre, codigo, precio_txt, mm):
+        from PyQt6.QtGui import QFont, QColor
+        from PyQt6.QtCore import QRectF, Qt
+
+        pad = 2 * mm
+        inner = QRectF(rect.left() + pad, rect.top() + pad,
+                       rect.width() - 2 * pad, rect.height() - 2 * pad)
+        painter.save()
+        name_h = inner.height() * 0.24
+        price_h = inner.height() * 0.24
+        code_txt_h = 4 * mm
+
+        # Nombre (arriba)
+        fn = QFont("Arial"); fn.setBold(True); fn.setPointSizeF(10)
+        painter.setFont(fn); painter.setPen(QColor("#111111"))
+        painter.drawText(
+            QRectF(inner.left(), inner.top(), inner.width(), name_h),
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+            nombre)
+
+        # Código de barras (centro)
+        bc_rect = QRectF(inner.left(), inner.top() + name_h,
+                         inner.width(), inner.height() - name_h - price_h - code_txt_h)
+        if renderer is not None and renderer.isValid():
+            vb = renderer.viewBoxF()
+            if vb.width() > 0 and vb.height() > 0 and bc_rect.height() > 0:
+                scale = min(bc_rect.width() / vb.width(), bc_rect.height() / vb.height())
+                w = vb.width() * scale; h = vb.height() * scale
+                tx = bc_rect.left() + (bc_rect.width() - w) / 2
+                ty = bc_rect.top() + (bc_rect.height() - h) / 2
+                renderer.render(painter, QRectF(tx, ty, w, h))
+
+        # Texto legible del código (debajo de las barras)
+        fc = QFont("Courier New"); fc.setPointSizeF(7)
+        painter.setFont(fc); painter.setPen(QColor("#333333"))
+        painter.drawText(
+            QRectF(inner.left(), bc_rect.bottom(), inner.width(), code_txt_h),
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+            codigo)
+
+        # Precio (abajo)
+        fp = QFont("Arial"); fp.setBold(True); fp.setPointSizeF(16)
+        painter.setFont(fp); painter.setPen(QColor("#000000"))
+        painter.drawText(
+            QRectF(inner.left(), inner.bottom() - price_h, inner.width(), price_h),
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom),
+            precio_txt)
+        painter.restore()
+
     # ── Categorías (modal CRUD bidi con VPS) ──
     def _open_categories_dialog(self):
         dlg = CategoriesDialog(self, self.store, on_changed=self._on_categories_changed)
@@ -2253,8 +2457,8 @@ class ProductsPage(QWidget):
             self.refresh()
 
     def _set_crud_enabled(self, enabled: bool):
-        for w in (self.save_btn, self.new_btn, self.delete_btn,
-                  self.sku, self.barcode, self.name, self.category,
+        for w in (self.save_btn, self.new_btn, self.gen_code_btn, self.print_label_btn,
+                  self.delete_btn, self.sku, self.barcode, self.name, self.category,
                   self.stock, self.min_stock, self.price, self.image_path,
                   self.genero_combo, self.cats_btn):
             try:
