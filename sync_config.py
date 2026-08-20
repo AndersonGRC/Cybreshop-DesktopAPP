@@ -54,8 +54,14 @@ def load(base_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return data
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        try:
+            text = path.read_text(encoding="utf-8")
+            legacy_encoding = False
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="cp1252")
+            legacy_encoding = True
+        raw = json.loads(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return data
     if not isinstance(raw, dict):
         return data
@@ -72,6 +78,11 @@ def load(base_dir: Path) -> dict[str, Any]:
         elif not isinstance(value, str):
             value = str(value) if value is not None else default
         data[key] = value
+    if legacy_encoding:
+        try:
+            save(base_dir, data)
+        except OSError:
+            pass
     return data
 
 

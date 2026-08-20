@@ -57,8 +57,16 @@ def load(base_dir: Path) -> dict[str, str]:
     if not path.exists():
         return data
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        try:
+            text = path.read_text(encoding="utf-8")
+            legacy_encoding = False
+        except UnicodeDecodeError:
+            # Versiones antiguas del instalador escribían con la página de
+            # códigos de Windows. Recuperar esos valores sin reemplazar tildes
+            # y migrar el archivo a UTF-8 después de parsearlo.
+            text = path.read_text(encoding="cp1252")
+            legacy_encoding = True
+    except (OSError, UnicodeDecodeError):
         return data
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -71,6 +79,13 @@ def load(base_dir: Path) -> dict[str, str]:
         v = v.strip().strip('"').strip("'")
         if k in DEFAULTS:
             data[k] = v
+    if legacy_encoding:
+        try:
+            save(base_dir, data)
+        except OSError:
+            # La lectura recuperada sigue siendo útil aunque no haya permisos
+            # para completar la migración en este arranque.
+            pass
     return data
 
 

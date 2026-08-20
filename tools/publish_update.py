@@ -77,7 +77,10 @@ def main():
     manifest = {
         "latest": a.version,
         "min_required": a.min_required,
-        "download_url": f"/static/installers/{a.filename}",
+        # Cache-buster: Cloudflare conserva los instaladores estáticos durante
+        # varios días. Una URL distinta por release evita servir el .exe viejo
+        # después de actualizar el archivo en producción.
+        "download_url": f"/static/installers/{a.filename}?v={a.version}",
         "checksum_sha256": checksum,
         "release_notes": a.notes,
         "updated_at": datetime.now(timezone.utc).isoformat(),

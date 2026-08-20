@@ -73,8 +73,14 @@ def load_branding(base_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return data
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        try:
+            text = path.read_text(encoding="utf-8")
+            legacy_encoding = False
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="cp1252")
+            legacy_encoding = True
+        raw = json.loads(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return data
 
     for group, defaults_group in DEFAULTS.items():
@@ -86,6 +92,11 @@ def load_branding(base_dir: Path) -> dict[str, Any]:
                 value = default_value
             data[group][key] = value.strip() if value else value
     _normalize(data)
+    if legacy_encoding:
+        try:
+            save_branding(base_dir, data)
+        except (OSError, ValueError):
+            pass
     return data
 
 

@@ -9,7 +9,7 @@ REM    3. Copia el .exe a static/installers/   (servido por /descargar)
 REM
 REM  Requisitos:
 REM    - venv\ creado (corre run.bat al menos una vez antes)
-REM    - Inno Setup 6 instalado en la ruta default de Program Files (x86)
+REM    - Inno Setup 6.3+ instalado (LoadStringsFromFile soporta UTF-8 sin BOM)
 REM ===============================================================
 
 cd /d "%~dp0"

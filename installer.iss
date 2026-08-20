@@ -1,5 +1,5 @@
 ; ===============================================================
-; CyberShop POS Desktop — Instalador con asistente (Inno Setup 6+)
+; CyberShop POS Desktop — Instalador con asistente (Inno Setup 6.3+)
 ;
 ; Compilar:    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 ; Salida:      Output\CyberShopSetup.exe
@@ -14,7 +14,7 @@
 ; ===============================================================
 
 #define AppName       "CyberShop POS"
-#define AppVersion    "1.0.0.4"
+#define AppVersion    "1.0.0.5"
 #define AppPublisher  "CyberShop"
 #define AppExeName    "CyberShopOffline.exe"
 
@@ -69,16 +69,16 @@ var
   Helpers para parsear bootstrap.json (parser muy simple, no
   requiere unidades externas). Asume el formato exacto que
   produce installer_packager.py:
-    server_url, api_key, tenant_slug — strings JSON simples.
+    server_url, api_key, tenant_slug, tenant_nombre — strings JSON simples.
   ──────────────────────────────────────────────────────────── *)
 
-function ExtractJsonString(const Json: AnsiString; const Key: String): String;
+function ExtractJsonString(const Json, Key: String): String;
 var
-  Pat: AnsiString;
+  Pat: String;
   P, EndQuote: Integer;
 begin
   Result := '';
-  Pat := AnsiString('"' + Key + '"');
+  Pat := '"' + Key + '"';
   P := Pos(Pat, Json);
   if P = 0 then Exit;
   P := P + Length(Pat);
@@ -88,26 +88,42 @@ begin
   EndQuote := P;
   while (EndQuote <= Length(Json)) and (Json[EndQuote] <> '"') do Inc(EndQuote);
   if EndQuote > Length(Json) then Exit;
-  Result := String(Copy(Json, P, EndQuote - P));
+  Result := Copy(Json, P, EndQuote - P);
+end;
+
+function LoadUtf8TextFile(const FileName: String; var Contents: String): Boolean;
+var
+  Lines: TArrayOfString;
+  I: Integer;
+begin
+  Result := LoadStringsFromFile(FileName, Lines);
+  if not Result then Exit;
+
+  Contents := '';
+  for I := 0 to GetArrayLength(Lines) - 1 do begin
+    if I > 0 then Contents := Contents + #10;
+    Contents := Contents + Lines[I];
+  end;
 end;
 
 procedure PreloadFromBootstrap();
 var
-  BootstrapPath: String;
-  Json: AnsiString;
-  ServerUrl, ApiKey, TenantSlug: String;
+  BootstrapPath, Json: String;
+  ServerUrl, ApiKey, TenantSlug, TenantNombre: String;
 begin
   BootstrapPath := ExpandConstant('{src}\bootstrap.json');
   if not FileExists(BootstrapPath) then Exit;
-  if not LoadStringFromFile(BootstrapPath, Json) then Exit;
+  if not LoadUtf8TextFile(BootstrapPath, Json) then Exit;
 
   ServerUrl  := ExtractJsonString(Json, 'server_url');
   ApiKey     := ExtractJsonString(Json, 'api_key');
   TenantSlug := ExtractJsonString(Json, 'tenant_slug');
+  TenantNombre := ExtractJsonString(Json, 'tenant_nombre');
 
   if ServerUrl  <> '' then ServerPage.Values[0] := ServerUrl;
   if ApiKey     <> '' then ServerPage.Values[1] := ApiKey;
   if TenantSlug <> '' then ServerPage.Values[2] := TenantSlug;
+  if TenantNombre <> '' then ServerPage.Values[3] := TenantNombre;
 end;
 
 procedure InitializeWizard();
@@ -122,6 +138,7 @@ begin
   ServerPage.Add('URL del servidor:', False);
   ServerPage.Add('API key (X-Sync-Key):', True);
   ServerPage.Add('Slug del tenant:', False);
+  ServerPage.Add('Nombre del cliente:', False);
 
   { Página 2: Postgres del cliente (opcional, modo avanzado) }
   PgPage := CreateInputQueryPage(ServerPage.ID,
@@ -163,32 +180,29 @@ end;
 procedure WriteCybershopConf();
 var
   ConfDir, ConfPath: String;
-  Lines: TStringList;
+  Lines: TArrayOfString;
 begin
   ConfDir  := ExpandConstant('{userappdata}\CyberShopNative');
   ConfPath := ConfDir + '\.cybershop.conf';
   if not DirExists(ConfDir) then ForceDirectories(ConfDir);
 
-  Lines := TStringList.Create;
-  try
-    Lines.Add('# Configuración generada por el asistente del instalador');
-    Lines.Add('# No editar a mano salvo que sepas lo que haces.');
-    Lines.Add('SERVER_URL='        + Trim(ServerPage.Values[0]));
-    Lines.Add('SYNC_API_KEY='      + Trim(ServerPage.Values[1]));
-    Lines.Add('TENANT_SLUG='       + Trim(ServerPage.Values[2]));
-    Lines.Add('TENANT_NOMBRE=');
-    Lines.Add('PG_HOST='           + Trim(PgPage.Values[0]));
-    Lines.Add('PG_PORT='           + Trim(PgPage.Values[1]));
-    Lines.Add('PG_DBNAME='         + Trim(PgPage.Values[2]));
-    Lines.Add('PG_USER='           + Trim(PgPage.Values[3]));
-    Lines.Add('PG_PASSWORD='       + Trim(PgPage.Values[4]));
-    Lines.Add('LOCAL_DB_PATH='     + ConfDir + '\cybershop_offline.db');
-    Lines.Add('SYNC_INTERVAL_SEC=30');
-    Lines.Add('AUTO_UPDATE_CHECK=true');
-    Lines.SaveToFile(ConfPath);
-  finally
-    Lines.Free;
-  end;
+  SetArrayLength(Lines, 14);
+  Lines[0]  := '# Configuración generada por el asistente del instalador';
+  Lines[1]  := '# No editar a mano salvo que sepas lo que haces.';
+  Lines[2]  := 'SERVER_URL='        + Trim(ServerPage.Values[0]);
+  Lines[3]  := 'SYNC_API_KEY='      + Trim(ServerPage.Values[1]);
+  Lines[4]  := 'TENANT_SLUG='       + Trim(ServerPage.Values[2]);
+  Lines[5]  := 'TENANT_NOMBRE='     + Trim(ServerPage.Values[3]);
+  Lines[6]  := 'PG_HOST='           + Trim(PgPage.Values[0]);
+  Lines[7]  := 'PG_PORT='           + Trim(PgPage.Values[1]);
+  Lines[8]  := 'PG_DBNAME='         + Trim(PgPage.Values[2]);
+  Lines[9]  := 'PG_USER='           + Trim(PgPage.Values[3]);
+  Lines[10] := 'PG_PASSWORD='       + Trim(PgPage.Values[4]);
+  Lines[11] := 'LOCAL_DB_PATH='     + ConfDir + '\cybershop_offline.db';
+  Lines[12] := 'SYNC_INTERVAL_SEC=30';
+  Lines[13] := 'AUTO_UPDATE_CHECK=true';
+  if not SaveStringsToUTF8FileWithoutBOM(ConfPath, Lines, False) then
+    RaiseException('No se pudo guardar la configuración en UTF-8: ' + ConfPath);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
