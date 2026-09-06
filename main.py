@@ -61,7 +61,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.1.0"
+APP_VERSION = "1.0.2.0"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
@@ -4041,6 +4041,10 @@ class SyncPage(QWidget):
             perms = cfg.get("permissions")
             if isinstance(perms, dict) and perms:  # manifiesto rol→{modules,actions}
                 self.store.set_permissions_manifest(perms)
+            try:  # modo simple del restaurante (agregar → cobrar), por cliente
+                self.store.set_restaurante_simple(bool(cfg.get("restaurante_simple")))
+            except Exception:
+                pass
         except SyncError as exc:
             print(f"[sync] pull_config: {exc}")
         except Exception as exc:
@@ -5025,9 +5029,11 @@ class RestaurantPage(QWidget):
 
         detail = self.store.rt_table_detail(self._selected_table)
         consumptions = detail["consumptions"]
+        simple = self.store.get_restaurante_simple()  # modo simple: agregar → cobrar
 
-        # ── Barra de progreso de preparación (Pendiente → Preparando → Servido) ──
-        self.detail_layout.addWidget(self._progress_widget(consumptions))
+        # ── Barra de progreso de preparación (solo modo completo) ──
+        if not simple:
+            self.detail_layout.addWidget(self._progress_widget(consumptions))
 
         # Vista cajero: resumen tipo recibo (sin controles de cocina ni alta de ítems)
         if self._view_mode == "cajero":
@@ -5043,11 +5049,14 @@ class RestaurantPage(QWidget):
             empty.setObjectName("muted"); empty.setWordWrap(True)
             self.detail_layout.addWidget(empty)
         else:
-            hint = QLabel("Toca el estado de cada ítem para avanzarlo: Pendiente → Preparando → Servido.")
+            if simple:
+                hint = QLabel("Agrega productos y luego cobra la mesa. Si te equivocaste, elimina el ítem con 🗑.")
+            else:
+                hint = QLabel("Toca el estado de cada ítem para avanzarlo: Pendiente → Preparando → Servido.")
             hint.setObjectName("rtHint"); hint.setWordWrap(True)
             self.detail_layout.addWidget(hint)
             for c in consumptions:
-                self.detail_layout.addWidget(self._consumption_row(c))
+                self.detail_layout.addWidget(self._consumption_row(c, simple=simple))
 
         total_lbl = QLabel(f"Total a cobrar:  {_rt_money(order.get('total_acumulado'))}")
         total_lbl.setObjectName("rtDetailTotal")
@@ -5083,7 +5092,8 @@ class RestaurantPage(QWidget):
         self.qty_spin = QSpinBox(); self.qty_spin.setRange(1, 100); self.qty_spin.setValue(1)
         qty_row.addWidget(qty_lbl); qty_row.addWidget(self.qty_spin); qty_row.addStretch(1)
         add_l.addLayout(qty_row)
-        self.cons_notas = QLineEdit(); self.cons_notas.setPlaceholderText("Notas para cocina (opcional)")
+        self.cons_notas = QLineEdit()
+        self.cons_notas.setPlaceholderText("Notas (opcional)" if simple else "Notas para cocina (opcional)")
         add_l.addWidget(self.cons_notas)
         add_btn = QPushButton("＋  Agregar a la cuenta")
         add_btn.setObjectName("primaryAction")
@@ -5103,11 +5113,12 @@ class RestaurantPage(QWidget):
         self.detail_layout.addWidget(charge_btn)
 
         actions = QHBoxLayout()
-        bill_btn = QPushButton("Pedir la cuenta")
-        bill_btn.setObjectName("secondaryAction")
-        bill_btn.setToolTip("Marca la mesa como 'Cuenta solicitada' (el cliente pidió la cuenta).")
-        bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
-        actions.addWidget(bill_btn)
+        if not simple:   # en modo simple no hay paso "solicitar cuenta"
+            bill_btn = QPushButton("Pedir la cuenta")
+            bill_btn.setObjectName("secondaryAction")
+            bill_btn.setToolTip("Marca la mesa como 'Cuenta solicitada' (el cliente pidió la cuenta).")
+            bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
+            actions.addWidget(bill_btn)
         # Cancelar cuenta: RESTAURANT_CANCEL (Administrador/Cajero) — vía manifiesto
         if self.can("restaurant", "cancel"):
             cancel_btn = QPushButton("Cancelar cuenta")
@@ -5213,7 +5224,7 @@ class RestaurantPage(QWidget):
         bill_btn.clicked.connect(lambda: self._set_table_state("cuenta_solicitada"))
         self.detail_layout.addWidget(bill_btn)
 
-    def _consumption_row(self, c: dict) -> QWidget:
+    def _consumption_row(self, c: dict, simple: bool = False) -> QWidget:
         row = QFrame(); row.setObjectName("rtConsRow")
         h = QHBoxLayout(row); h.setContentsMargins(10, 8, 10, 8); h.setSpacing(8)
         left = QVBoxLayout(); left.setSpacing(1)
@@ -5227,6 +5238,17 @@ class RestaurantPage(QWidget):
         sub = QLabel(_rt_money(c["subtotal"]))
         sub.setObjectName("rtConsSub")
         h.addWidget(sub)
+        if simple:
+            # Modo simple: sin flujo de cocina; el ítem se muestra "entregado" y
+            # solo se ofrece eliminar (corrección de un producto mal agregado).
+            if self.can("restaurant", "create"):
+                del_btn = QPushButton("🗑")
+                del_btn.setObjectName("rtStateBtn")
+                del_btn.setToolTip("Eliminar este producto de la cuenta.")
+                del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                del_btn.clicked.connect(lambda _=False, cid=c["local_id"]: self._remove_consumption(cid))
+                h.addWidget(del_btn)
+            return row
         state_btn = QPushButton(_RT_CONSUMPTION_LABELS.get(c["estado"], c["estado"]))
         state_btn.setObjectName("rtStateBtn")
         state_btn.setProperty("estado", c["estado"])
@@ -5290,6 +5312,17 @@ class RestaurantPage(QWidget):
         new_state = _RT_CONSUMPTION_NEXT.get(current_state, "servido")
         try:
             self.store.rt_set_consumption_state(consumption_local_id, new_state, user=self._user())
+        except ValueError as exc:
+            self._error(str(exc)); return
+        self._after_change()
+
+    def _remove_consumption(self, consumption_local_id: int):
+        confirm = QMessageBox.question(self, "Eliminar producto",
+                                       "¿Eliminar este producto de la cuenta?")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.rt_remove_consumption(consumption_local_id, user=self._user())
         except ValueError as exc:
             self._error(str(exc)); return
         self._after_change()

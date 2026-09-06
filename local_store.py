@@ -1248,10 +1248,10 @@ class LocalStore:
             conn.execute(
                 """INSERT INTO rt_consumptions
                        (order_local_id, table_id, producto_id, descripcion, cantidad,
-                        precio_unitario, subtotal, estado, notas, synced, ordered_at)
-                   VALUES (?,?,?,?,?,?,?, 'pendiente', ?, 0, CURRENT_TIMESTAMP)""",
+                        precio_unitario, subtotal, estado, notas, synced, ordered_at, op_uuid)
+                   VALUES (?,?,?,?,?,?,?, 'pendiente', ?, 0, CURRENT_TIMESTAMP, ?)""",
                 (order_local_id, table_id, int(producto_id) if producto_id else None,
-                 descripcion, cantidad, precio_unitario, subtotal, notas or None),
+                 descripcion, cantidad, precio_unitario, subtotal, notas or None, op_uuid),
             )
             # recalcula total local
             conn.execute(
@@ -1285,6 +1285,54 @@ class LocalStore:
             payload = {"op": "set_consumption_state", "consumption_id": int(row["remote_id"]), "estado": new_state}
             payload.update(self._rt_user_fields(user))
             self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+
+    def rt_remove_consumption(self, consumption_local_id: int, user=None):
+        """Remueve un consumo de la cuenta (corrección de error). Offline-first.
+        - No permite remover uno ya 'servido' (consistente con la web).
+        - Si el add aún no se sincronizó (remote_id NULL): borra local y cancela
+          el 'add' pendiente del outbox (nunca llega al server).
+        - Si ya se sincronizó: encola op 'remove_consumption' (por remote_id; o por
+          uuid si el add ya se envió pero aún no mapeó su remote_id)."""
+        cid = int(consumption_local_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT remote_id, estado, order_local_id, op_uuid FROM rt_consumptions WHERE id=?",
+                (cid,)).fetchone()
+            if not row:
+                raise ValueError("Consumo no encontrado.")
+            if row["estado"] == "servido":
+                raise ValueError("No puedes remover un producto ya servido.")
+            order_local_id = int(row["order_local_id"])
+            remote_id = row["remote_id"]
+            op_uuid = row["op_uuid"]
+
+            conn.execute("DELETE FROM rt_consumptions WHERE id=?", (cid,))
+            conn.execute(
+                """UPDATE rt_orders SET
+                       total_acumulado = (SELECT COALESCE(SUM(subtotal),0)
+                                            FROM rt_consumptions WHERE order_local_id=?),
+                       synced=0, last_activity_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (order_local_id, order_local_id))
+
+            if remote_id is not None:
+                payload = {"op": "remove_consumption", "consumption_id": int(remote_id)}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
+                return
+            # No sincronizado: cancelar el 'add' pendiente del outbox si sigue ahí.
+            cancelled = 0
+            if op_uuid:
+                cur = conn.execute(
+                    "DELETE FROM outbox WHERE entity='restaurant_op' AND entity_id=? AND synced_at IS NULL",
+                    (op_uuid,))
+                cancelled = cur.rowcount
+            if cancelled:
+                return  # el add nunca salió → nada que remover en el server
+            if op_uuid:  # el add ya se envió: remover por uuid (server lo resuelve)
+                payload = {"op": "remove_consumption", "target_uuid": op_uuid}
+                payload.update(self._rt_user_fields(user))
+                self._queue_outbox(conn, "restaurant_op", _uuid.uuid4().hex, "create", payload)
 
     def rt_set_table_state(self, table_id: int, new_state: str, user=None):
         if new_state not in self.RT_TABLE_STATES:
@@ -2789,7 +2837,8 @@ class LocalStore:
                     notas TEXT,
                     ordered_at TEXT,
                     synced INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    op_uuid TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_rt_orders_table ON rt_orders(table_id, estado);
@@ -2797,6 +2846,8 @@ class LocalStore:
                 CREATE INDEX IF NOT EXISTS idx_rt_tables_area ON rt_tables(area);
                 """
             )
+            # Migración: uuid del 'add' por consumo (para cancelar/remover offline).
+            self._ensure_column(conn, "rt_consumptions", "op_uuid", "TEXT")
 
             # ── Modulo Contabilidad: espejo local de las tablas de produccion ──
             conn.executescript(
@@ -3089,6 +3140,21 @@ class LocalStore:
         """Persiste el manifiesto de permisos para gating offline por rol+acción."""
         with self.connect() as conn:
             self._set_meta(conn, "permissions_manifest", json.dumps(manifest, ensure_ascii=True))
+
+    def get_restaurante_simple(self) -> bool:
+        """Flag 'modo simple' del restaurante (agregar -> cobrar) cacheado del server.
+        Default False = modo completo (cocina/tiempos). Fail-open a False."""
+        try:
+            with self.connect() as conn:
+                raw = self._get_meta(conn, "restaurante_simple")
+        except Exception:
+            return False
+        return str(raw or "").strip().lower() in ("true", "1", "yes", "on", "si")
+
+    def set_restaurante_simple(self, on: bool) -> None:
+        """Persiste el flag 'modo simple' del restaurante para uso offline."""
+        with self.connect() as conn:
+            self._set_meta(conn, "restaurante_simple", "true" if on else "false")
 
     # ── IA: historial de chat local ─────────────────────────────
     def ia_add_message(self, rol: str, texto: str, herramienta: str | None = None) -> None:
