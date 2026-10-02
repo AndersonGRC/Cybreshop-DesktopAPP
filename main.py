@@ -61,7 +61,7 @@ from local_store import LocalStore, app_data_dir
 from sync_client import SyncClient, SyncError
 
 
-APP_VERSION = "1.0.2.0"
+APP_VERSION = "1.0.3.0"
 ROLES = ["Administrador", "Empleado", "Cajero", "Mesero", "Contador"]
 
 # Módulos visibles por rol — espejo de los grupos de permisos de security.py
@@ -7832,8 +7832,9 @@ class _NovedadDialog(QDialog):
         salario = float(emp.get("salario_base") or 0)
         smmlv = float(self._params.get("salario_minimo") or 0)
         if tipo in nomina_calc.TIPOS_EXTRAS:
-            vh = nomina_calc.calcular_valor_hora(salario)
             from datetime import date as _d
+            # Valor hora con la jornada vigente en la fecha de la novedad (Ley 2101).
+            vh = nomina_calc.calcular_valor_hora(salario, _d.fromisoformat(fecha))
             valor = nomina_calc.calcular_horas_extras(vh, tipo, cant, _d.fromisoformat(fecha))
         elif tipo in nomina_calc.TIPOS_LICENCIAS_REMUNERADAS:
             valor = nomina_calc.calcular_incapacidad(salario, int(cant), tipo, smmlv) if hasattr(nomina_calc, "calcular_incapacidad") else 0
